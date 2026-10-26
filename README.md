@@ -53,6 +53,11 @@ upstream Zed(v1.25.3)를 받아 → `i18n/ko.json` 적용 → `config/`의 테�
 sudo xattr -rd com.apple.quarantine /Applications/<이름>.app
 ```
 
+## 문서
+
+- [사용법](./docs/사용법.md) — 빌드·설치, Claude 연결, 쓰는 법, 단축키
+- [아키텍처](./docs/아키텍처.md) — 전체 구조·번역 파이프라인
+
 ## 라이선스
 
 Zed는 **GPL-3.0**. 이 저장소의 수정분도 동일 라이선스를 따른다. 원저작권·출처는 [NOTICE](./NOTICE) 참고. "Zed" 이름·로고는 Zed Industries의 상표이며, 재배포 시 **다른 이름·아이콘**을 사용한다.
