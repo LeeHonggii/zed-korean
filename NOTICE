@@ -1,0 +1,12 @@
+이 저장소는 Zed Editor (https://github.com/zed-industries/zed) 의 파생 저작물이다.
+
+- 원저작: Zed Industries, Inc. 및 기여자들
+- 원 라이선스: GPL-3.0-or-later (collab 등 일부 AGPL-3.0)
+- 변경 사항: UI 문자열 한국어화(i18n/ko.json), 테마/설정 오버라이드(config/),
+  빌드 스크립트(scripts/). Zed 소스 자체는 포함하지 않으며 빌드 시 upstream 에서 받는다.
+
+번역 파이프라인은 x6nux/zed-globalization (https://github.com/x6nux/zed-globalization) 의
+zedl10n 도구를 사용한다.
+
+"Zed" 이름과 로고는 Zed Industries 의 상표이다. 이 파생물을 재배포할 때는
+혼동을 피하기 위해 다른 제품명과 아이콘을 사용한다.

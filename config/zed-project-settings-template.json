@@ -1,0 +1,12 @@
+{
+  "//": "프로젝트별 <프로젝트>/.zed/settings.json 템플릿. pythonPath 를 그 프로젝트 전용 conda env 로 바꿔 두면 언어서버가 자동으로 그 환경을 쓴다.",
+  "lsp": {
+    "basedpyright": {
+      "settings": {
+        "python": {
+          "pythonPath": "/Users/<나>/anaconda3/envs/<프로젝트env>/bin/python"
+        }
+      }
+    }
+  }
+}

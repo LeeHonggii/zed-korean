@@ -1,0 +1,7 @@
+# 빌드 산출물·소스 트리는 커밋하지 않는다 (빌드 시 받는다)
+zed-src/
+target/
+*.app
+*.dmg
+.DS_Store
+scratchpad/
