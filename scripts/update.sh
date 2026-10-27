@@ -33,6 +33,10 @@ rm -rf "$APP_DST"
 cp -R "$BUILT" "$APP_DST"
 xattr -cr "$APP_DST" 2>/dev/null || true
 
+# 빌드 산출물 Zed.app/dmg 삭제 — Spotlight/Launchpad에 중복으로 안 뜨게
+REL="$SRC_DIR/target/aarch64-apple-darwin/release"
+rm -rf "$REL/dmg/Zed.app" "$REL/bundle/osx/Zed.app" "$REL"/Zed-*.dmg 2>/dev/null || true
+
 echo "==> 완료. 한글 수 확인:"
 grep -a -c "스레드" "$APP_DST/Contents/MacOS/zed" | xargs echo "  '스레드' 건수:"
 echo "   open $APP_DST 로 실행"
