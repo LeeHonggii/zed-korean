@@ -7,8 +7,19 @@ SRC_DIR="${ZED_SRC:-$HOME/Tools/zed-src}"
 APP_DST="${ZED_APP:-/Applications/Zed.app}"
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# zedl10n 은 보통 전용 venv 에 설치돼 있다. PATH 에 없으면 venv 를 찾아 쓴다.
+ZEDL10N="zedl10n"
+if ! command -v zedl10n >/dev/null 2>&1; then
+  if [ -x "$HOME/Tools/zed-globalization/.venv/bin/zedl10n" ]; then
+    ZEDL10N="$HOME/Tools/zed-globalization/.venv/bin/zedl10n"
+  else
+    echo "   ❌ zedl10n 없음: pip install git+https://github.com/x6nux/zed-globalization.git" >&2
+    exit 1
+  fi
+fi
+
 echo "==> 1. 번역 적용 (i18n/ko.json → 소스)"
-zedl10n replace --input "$REPO_DIR/i18n/ko.json" --source-root "$SRC_DIR"
+"$ZEDL10N" replace --input "$REPO_DIR/i18n/ko.json" --source-root "$SRC_DIR"
 
 echo "==> 2. 증분 빌드"
 cd "$SRC_DIR"
