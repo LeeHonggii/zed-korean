@@ -1,0 +1,3127 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7f2a220..3192089 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -113,6 +113,7 @@ members = [
+     "crates/http_client_tls",
+     "crates/http_proxy",
+     "crates/icons",
++    "crates/canvas_editor",
+     "crates/image_viewer",
+     "crates/input_latency_ui",
+     "crates/inspector_ui",
+@@ -386,6 +387,7 @@ http_client = { path = "crates/http_client" }
+ http_client_tls = { path = "crates/http_client_tls" }
+ http_proxy = { path = "crates/http_proxy" }
+ icons = { path = "crates/icons" }
++canvas_editor = { path = "crates/canvas_editor" }
+ image_viewer = { path = "crates/image_viewer" }
+ input_latency_ui = { path = "crates/input_latency_ui" }
+ inspector_ui = { path = "crates/inspector_ui" }
+diff --git a/crates/acp_thread/src/acp_thread.rs b/crates/acp_thread/src/acp_thread.rs
+index fbfab0e..23af382 100644
+--- a/crates/acp_thread/src/acp_thread.rs
++++ b/crates/acp_thread/src/acp_thread.rs
+@@ -115,6 +115,42 @@ pub fn tool_name_from_meta(meta: &Option<acp_v2::Meta>) -> Option<SharedString>
+         .map(|name| SharedString::from(name.to_owned()))
+ }
+ 
++fn activity_title(call: &ToolCall, cx: &App) -> String {
++    let from_input = call.raw_input.as_ref().and_then(|input| {
++        ["description", "command"]
++            .iter()
++            .find_map(|key| input.get(*key).and_then(|value| value.as_str()))
++            .filter(|text| !text.trim().is_empty())
++            .map(str::to_owned)
++    });
++    let source = from_input.unwrap_or_else(|| call.label.read(cx).source().to_string());
++    let line = source.lines().next().unwrap_or_default().replace('`', "");
++    let line = line.trim();
++    if line.chars().count() > 60 {
++        format!("{}…", line.chars().take(60).collect::<String>())
++    } else {
++        line.to_string()
++    }
++}
++
++fn is_background_activity(call: &ToolCall) -> bool {
++    call.id.0.starts_with("bgtask-") || call.id.0.starts_with("hook-")
++}
++
++fn activity_kind_label(kind: &acp_v2::ToolKind) -> &'static str {
++    match kind {
++        acp_v2::ToolKind::Read => "읽기",
++        acp_v2::ToolKind::Edit => "수정",
++        acp_v2::ToolKind::Delete => "삭제",
++        acp_v2::ToolKind::Move => "이동",
++        acp_v2::ToolKind::Search => "검색",
++        acp_v2::ToolKind::Execute => "실행",
++        acp_v2::ToolKind::Think => "생각",
++        acp_v2::ToolKind::Fetch => "웹",
++        _ => "기타",
++    }
++}
++
+ /// Creates ACP metadata containing the legacy tool-name field.
+ pub fn meta_with_tool_name(tool_name: &str) -> acp_v2::Meta {
+     acp_v2::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
+@@ -3965,6 +4001,103 @@ impl AcpThread {
+         &self.entries
+     }
+ 
++    /// 하네스 패치: 이번 턴에 도는 도구·서브에이전트·할 일을 claude-hud 형식 줄로 만든다.
++    pub fn activity_lines(&self, cx: &App) -> Vec<SharedString> {
++        let turn_start = self
++            .entries
++            .iter()
++            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
++            .map_or(0, |ix| ix + 1);
++        let mut running = Vec::new();
++        let mut agents = Vec::new();
++        let mut done: Vec<(&'static str, usize)> = Vec::new();
++        let mut last_done_title = None;
++        for entry in &self.entries[turn_start..] {
++            let AgentThreadEntry::ToolCall(call) = entry else {
++                continue;
++            };
++            if is_background_activity(call) {
++                continue;
++            }
++            let status = call.status();
++            let active = matches!(
++                status,
++                ToolCallStatus::Pending
++                    | ToolCallStatus::InProgress
++                    | ToolCallStatus::WaitingForConfirmation
++            );
++            if call.is_subagent() {
++                if active {
++                    agents.push(format!("◐ 서브에이전트: {}", activity_title(call, cx)));
++                }
++            } else if active {
++                running.push(format!("◐ {}", activity_title(call, cx)));
++            } else if matches!(status, ToolCallStatus::Completed) {
++                last_done_title = Some(activity_title(call, cx));
++                let kind = activity_kind_label(call.kind());
++                match done.iter_mut().find(|(label, _)| *label == kind) {
++                    Some((_, count)) => *count += 1,
++                    None => done.push((kind, 1)),
++                }
++            }
++        }
++
++        let mut lines: Vec<SharedString> = Vec::new();
++        if running.is_empty() && agents.is_empty() && self.status() == ThreadStatus::Generating {
++            running.push(match last_done_title {
++                Some(title) => format!("◐ 답변 작성 중 · 직전: {title}"),
++                None => "◐ 답변 작성 중".to_string(),
++            });
++        }
++        if !running.is_empty() || !done.is_empty() {
++            let mut parts = running;
++            parts.extend(done.into_iter().map(|(label, count)| {
++                if count > 1 {
++                    format!("✓ {label} ×{count}")
++                } else {
++                    format!("✓ {label}")
++                }
++            }));
++            lines.push(parts.join(" | ").into());
++        }
++        lines.extend(agents.into_iter().map(SharedString::from));
++        lines.extend(self.background_activity_lines(cx));
++        if let Some(plan) = self.plan() {
++            let stats = plan.stats();
++            if let Some(entry) = stats.in_progress_entry {
++                lines.push(
++                    format!(
++                        "▸ {} ({}/{})",
++                        entry.source.content,
++                        stats.completed,
++                        plan.entries.len()
++                    )
++                    .into(),
++                );
++            }
++        }
++        lines
++    }
++
++    /// 하네스 패치: 턴과 상관없이 아직 도는 백그라운드 작업·훅 카드(어댑터가 bgtask-/hook- 로 보냄).
++    pub fn background_activity_lines(&self, cx: &App) -> Vec<SharedString> {
++        self.entries
++            .iter()
++            .filter_map(|entry| match entry {
++                AgentThreadEntry::ToolCall(call)
++                    if is_background_activity(call)
++                        && matches!(
++                            call.status(),
++                            ToolCallStatus::Pending | ToolCallStatus::InProgress
++                        ) =>
++                {
++                    Some(SharedString::from(format!("◐ {}", activity_title(call, cx))))
++                }
++                _ => None,
++            })
++            .collect()
++    }
++
+     pub fn notices(&self) -> &[(usize, acp_v2::Notice)] {
+         &self.notices
+     }
+@@ -10384,7 +10517,7 @@ mod tests {
+                 assert_eq!(reused.read(cx).inner().entity_id(), lower.entity_id());
+                 assert_eq!(
+                     reused.read(cx).command().read(cx).source(),
+-                    "```\nactual command\n```"
++                    "```sh\nactual command\n```"
+                 );
+                 assert!(lower.read(cx).get_content().contains("early"));
+                 let (_, tool) = thread.tool_call(&tool_id).expect("tool");
+@@ -10405,7 +10538,7 @@ mod tests {
+             terminal.read_with(cx, |terminal, cx| {
+                 assert_eq!(
+                     terminal.command().read(cx).source(),
+-                    "```\nactual command\n```"
++                    "```sh\nactual command\n```"
+                 );
+             });
+             thread
+@@ -10428,7 +10561,7 @@ mod tests {
+                 })
+                 .expect("explicit command clear remains authoritative");
+             terminal.read_with(cx, |terminal, cx| {
+-                assert_eq!(terminal.command().read(cx).source(), "```\nTerminal\n```");
++                assert_eq!(terminal.command().read(cx).source(), "```sh\nTerminal\n```");
+             });
+             thread
+                 .update(cx, |thread, cx| {
+@@ -10752,7 +10885,7 @@ mod tests {
+             assert!(terminal.inner().read(cx).get_content().contains("fresh"));
+             assert_eq!(
+                 terminal.command().read(cx).source(),
+-                "```\nfirst command\n```"
++                "```sh\nfirst command\n```"
+             );
+         });
+         thread
+@@ -10851,7 +10984,7 @@ mod tests {
+             assert!(terminal.display_state().is_none());
+             assert_eq!(
+                 terminal.command().read(cx).source(),
+-                "```\nnative command\n```"
++                "```sh\nnative command\n```"
+             );
+             assert!(terminal.output().is_none());
+             assert_eq!(lower.read(cx).get_content(), before);
+@@ -11082,7 +11215,7 @@ mod tests {
+                 .expect("v2 title update changes the client-managed command label");
+             assert_eq!(
+                 terminal.read(cx).command().read(cx).source().as_ref(),
+-                "```\nUpdated native command\n```"
++                "```sh\nUpdated native command\n```"
+             );
+         });
+ 
+@@ -17924,7 +18057,7 @@ mod tests {
+                     )
+                     .is_err()
+             );
+-            assert_eq!(command.read(cx).source(), "```\noriginal command\n```");
++            assert_eq!(command.read(cx).source(), "```sh\noriginal command\n```");
+             let (_, call) = thread.tool_call(&id).expect("unchanged tool");
+             assert_eq!(call.label.read(cx).source(), "Tool caption");
+             assert_eq!(call.terminals().next(), Some(&terminal));
+@@ -17942,7 +18075,7 @@ mod tests {
+                     cx,
+                 )
+                 .expect("valid terminal update");
+-            assert_eq!(command.read(cx).source(), "```\nchanged command\n```");
++            assert_eq!(command.read(cx).source(), "```sh\nchanged command\n```");
+             assert_eq!(
+                 thread.tool_call(&id).expect("tool").1.terminals().next(),
+                 Some(&terminal)
+diff --git a/crates/acp_thread/src/terminal.rs b/crates/acp_thread/src/terminal.rs
+index ba9b595..8206ef7 100644
+--- a/crates/acp_thread/src/terminal.rs
++++ b/crates/acp_thread/src/terminal.rs
+@@ -527,9 +527,10 @@ impl Terminal {
+         Self {
+             id,
+             _sandbox: sandbox,
++            // 하네스 패치: 명령어를 ```sh 로 감싸 셸 문법 색을 입힌다.
+             command: cx.new(|cx| {
+                 Markdown::new(
+-                    format!("```\n{}\n```", command_label).into(),
++                    fence_shell_command(command_label).into(),
+                     Some(language_registry.clone()),
+                     None,
+                     cx,
+@@ -586,7 +587,7 @@ impl Terminal {
+             id,
+             command: cx.new(|cx| {
+                 Markdown::new(
+-                    format!("```\n{}\n```", command_label.unwrap_or("Terminal")).into(),
++                    fence_shell_command(command_label.unwrap_or("Terminal")).into(),
+                     Some(language_registry),
+                     None,
+                     cx,
+@@ -786,7 +787,7 @@ impl Terminal {
+                 state.command = DisplayCommand::Reported(command.take());
+                 self.command.update(cx, |markdown, cx| {
+                     markdown.replace(
+-                        format!("```\n{}\n```", state.command().unwrap_or("Terminal")),
++                        fence_shell_command(state.command().unwrap_or("Terminal")),
+                         cx,
+                     );
+                 });
+@@ -873,7 +874,7 @@ impl Terminal {
+             state.command = DisplayCommand::LegacyCaption(label.to_owned());
+         }
+         self.command.update(cx, |command, cx| {
+-            command.replace(format!("```\n{}\n```", label), cx);
++            command.replace(fence_shell_command(label), cx);
+         });
+     }
+ 
+@@ -1078,3 +1079,52 @@ mod linux_tests {
+             .expect("uncapturable protected paths must be dropped, not fail the policy");
+     }
+ }
++
++// 하네스 패치: 명령 안에 ``` 줄이 있어도 코드 블록이 중간에 닫히지 않게, 명령 속 가장 긴 백틱 묶음보다 긴 울타리로 감싼다.
++pub fn fence_shell_command(command: &str) -> String {
++    let longest_run = command
++        .split(|c| c != '`')
++        .map(str::len)
++        .max()
++        .unwrap_or(0);
++    let fence = "`".repeat(longest_run.max(2) + 1);
++    format!("{fence}sh\n{command}\n{fence}")
++}
++
++pub fn unfence_shell_command(source: &str) -> Option<&str> {
++    let fence_len = source.chars().take_while(|c| *c == '`').count();
++    if fence_len < 3 {
++        return None;
++    }
++    let fence = &source[..fence_len];
++    let body = source[fence_len..]
++        .strip_prefix("sh\n")
++        .or_else(|| source[fence_len..].strip_prefix('\n'))?;
++    body.strip_suffix(fence)?.strip_suffix('\n')
++}
++
++#[cfg(test)]
++mod fence_tests {
++    use super::*;
++
++    #[test]
++    fn plain_command_uses_three_backticks() {
++        assert_eq!(fence_shell_command("ls -la"), "```sh\nls -la\n```");
++        assert_eq!(unfence_shell_command("```sh\nls -la\n```"), Some("ls -la"));
++    }
++
++    #[test]
++    fn command_with_fence_line_gets_longer_fence() {
++        let command = "cat > a.md <<'EOF'\n```bash\necho hi\n```\nEOF";
++        let fenced = fence_shell_command(command);
++        assert!(fenced.starts_with("````sh\n"));
++        assert!(fenced.ends_with("\n````"));
++        assert_eq!(unfence_shell_command(&fenced), Some(command));
++    }
++
++    #[test]
++    fn unfenced_source_is_rejected() {
++        assert_eq!(unfence_shell_command("ls -la"), None);
++        assert_eq!(unfence_shell_command("```\nls\n```"), Some("ls"));
++    }
++}
+diff --git a/crates/agent_servers/src/acp/v1.rs b/crates/agent_servers/src/acp/v1.rs
+index 4289e87..662daa3 100644
+--- a/crates/agent_servers/src/acp/v1.rs
++++ b/crates/agent_servers/src/acp/v1.rs
+@@ -4653,7 +4653,7 @@ mod tests {
+             assert_eq!(terminal.inner(), &renderer);
+             assert_eq!(
+                 terminal.command().read(cx).source(),
+-                "```\nwire command\n```"
++                "```sh\nwire command\n```"
+             );
+             assert_eq!(
+                 terminal.working_dir().as_deref(),
+diff --git a/crates/agent_servers/src/custom.rs b/crates/agent_servers/src/custom.rs
+index c84bd80..77a56d0 100644
+--- a/crates/agent_servers/src/custom.rs
++++ b/crates/agent_servers/src/custom.rs
+@@ -36,7 +36,17 @@ impl AgentServer for CustomAgentServer {
+     }
+ 
+     fn logo(&self) -> IconName {
+-        IconName::Terminal
++        // 하네스 패치: 열린 스레드도 이름으로 Claude/Codex/Gemini 로고를 쓴다(사이드바가 이 값으로 덮어씀).
++        let name = self.agent_id.0.to_lowercase();
++        if name.contains("claude") {
++            IconName::AiClaude
++        } else if name.contains("codex") || name.contains("gpt") || name.contains("openai") {
++            IconName::AiOpenAi
++        } else if name.contains("gemini") {
++            IconName::AiGemini
++        } else {
++            IconName::Terminal
++        }
+     }
+ 
+     fn default_mode(&self, cx: &App) -> Option<acp_v2::SessionConfigValueId> {
+diff --git a/crates/agent_ui/src/agent_panel.rs b/crates/agent_ui/src/agent_panel.rs
+index 546c52e..886c22c 100644
+--- a/crates/agent_ui/src/agent_panel.rs
++++ b/crates/agent_ui/src/agent_panel.rs
+@@ -6114,7 +6114,13 @@ impl AgentPanel {
+             })
+             .when(!has_custom_icon, |this| {
+                 this.when_some(selected_agent_builtin_icon, |this, icon| {
+-                    this.child(Icon::new(icon).color(Color::Muted))
++                    // 하네스 패치: Claude 로고는 Claude 주황색으로 칠한다.
++                    let color = if icon == IconName::AiClaude {
++                        Color::Custom(gpui::rgb(0xD97757).into())
++                    } else {
++                        Color::Muted
++                    };
++                    this.child(Icon::new(icon).color(color))
+                 })
+             })
+             .tooltip(move |_, cx| {
+diff --git a/crates/agent_ui/src/agent_ui.rs b/crates/agent_ui/src/agent_ui.rs
+index ddf573c..824f691 100644
+--- a/crates/agent_ui/src/agent_ui.rs
++++ b/crates/agent_ui/src/agent_ui.rs
+@@ -570,7 +570,22 @@ impl Agent {
+     pub fn icon(&self) -> Option<IconName> {
+         match self {
+             Self::NativeAgent => None,
+-            Self::Custom { .. } => Some(IconName::Sparkle),
++            // 하네스 패치: 커스텀 에이전트도 이름으로 아이콘 구분(Claude/Codex/Gemini).
++            Self::Custom { id } => {
++                let name = id.0.to_lowercase();
++                Some(if name.contains("claude") {
++                    IconName::AiClaude
++                } else if name.contains("codex")
++                    || name.contains("gpt")
++                    || name.contains("openai")
++                {
++                    IconName::AiOpenAi
++                } else if name.contains("gemini") {
++                    IconName::AiGemini
++                } else {
++                    IconName::Sparkle
++                })
++            }
+             #[cfg(any(test, feature = "test-support"))]
+             Self::Stub => None,
+         }
+diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
+index 3ed8d1c..1d8241e 100644
+--- a/crates/agent_ui/src/conversation_view.rs
++++ b/crates/agent_ui/src/conversation_view.rs
+@@ -1707,8 +1707,9 @@ impl ConversationView {
+             });
+ 
+         let weak = cx.weak_entity();
++        let title_override = self.title_override(cx);
+         cx.new(|cx| {
+-            ThreadView::new(
++            let mut thread_view = ThreadView::new(
+                 self.thread_id,
+                 thread,
+                 conversation,
+@@ -1733,7 +1734,13 @@ impl ConversationView {
+                 subscriptions,
+                 window,
+                 cx,
+-            )
++            );
++            if let Some(title) = title_override {
++                thread_view.sync_title_editor(title, window, cx);
++            } else {
++                thread_view.refresh_placeholder(window, cx);
++            }
++            thread_view
+         })
+     }
+ 
+@@ -2286,12 +2293,17 @@ impl ConversationView {
+                         placeholder_text(agent_display_name.as_ref(), has_slash_completions);
+ 
+                     thread_view.update(cx, |thread_view, cx| {
+-                        let mut session_capabilities = thread_view.session_capabilities.write();
+-                        session_capabilities.set_available_commands(available_commands.clone());
+-                        session_capabilities.set_available_skills(available_skills);
++                        {
++                            let mut session_capabilities =
++                                thread_view.session_capabilities.write();
++                            session_capabilities
++                                .set_available_commands(available_commands.clone());
++                            session_capabilities.set_available_skills(available_skills);
++                        }
+                         thread_view.message_editor.update(cx, |editor, cx| {
+                             editor.set_placeholder_text(&new_placeholder, window, cx);
+                         });
++                        thread_view.refresh_placeholder(window, cx);
+                     });
+                 }
+             }
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index 90c9e0d..0af9c3c 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -3065,12 +3065,30 @@ impl ThreadView {
+         cx: &mut Context<Self>,
+     ) {
+         if self.title_editor.read(cx).text(cx) == title {
++            self.refresh_placeholder(window, cx);
+             return;
+         }
+         self.title_editor_sync_version = self.title_editor.update(cx, |editor, cx| {
+             editor.set_text(title, window, cx);
+             Self::title_editor_version(editor, cx)
+         });
++        self.refresh_placeholder(window, cx);
++    }
++
++    /// 하네스 패치: 입력창 안내에 에이전트 이름 대신 사용자가 정한 스레드 이름을 쓴다.
++    pub(super) fn refresh_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        let title = self.title_editor.read(cx).text(cx);
++        let title = title.trim();
++        let name = if title.is_empty() || title == DEFAULT_THREAD_TITLE {
++            self.agent_display_name.to_string()
++        } else {
++            title.to_string()
++        };
++        let has_slash_completions = self.session_capabilities.read().has_slash_completions();
++        let placeholder = placeholder_text(&name, has_slash_completions);
++        self.message_editor.update(cx, |editor, cx| {
++            editor.set_placeholder_text(&placeholder, window, cx);
++        });
+     }
+ 
+     pub fn handle_title_editor_event(
+@@ -3798,7 +3816,25 @@ impl ThreadView {
+         };
+         let has_awaiting_permission = awaiting_permission.is_some();
+ 
+-        if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
++        // 하네스 패치: 응답 중이면 지금 도는 도구·서브에이전트를 입력창 위에 띄운다.
++        // 할 일(▸)은 아래 plan 요약이 이미 보여 주므로 뺀다.
++        let activity_lines = if thread.status() == acp_thread::ThreadStatus::Generating {
++            thread
++                .activity_lines(cx)
++                .into_iter()
++                .filter(|line| !line.starts_with('▸'))
++                .collect::<Vec<_>>()
++        } else {
++            thread.background_activity_lines(cx)
++        };
++        let has_activity = !activity_lines.is_empty();
++
++        if changed_buffers.is_empty()
++            && !has_plan
++            && queue_is_empty
++            && !has_awaiting_permission
++            && !has_activity
++        {
+             return None;
+         }
+ 
+@@ -3841,6 +3877,27 @@ impl ThreadView {
+                                 .blur_radius(px(2.)),
+                         ])
+                     })
++                    .when(has_activity, |this| {
++                        this.child(
++                            v_flex()
++                                .px_2()
++                                .py_1()
++                                .gap_0p5()
++                                .children(activity_lines.into_iter().map(|line| {
++                                    Label::new(line)
++                                        .size(LabelSize::Small)
++                                        .color(Color::Muted)
++                                        .truncate()
++                                })),
++                        )
++                        .when(
++                            has_awaiting_permission
++                                || has_plan
++                                || !changed_buffers.is_empty()
++                                || !queue_is_empty,
++                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
++                        )
++                    })
+                     .when_some(awaiting_permission, |this, element| this.child(element))
+                     .when(
+                         has_awaiting_permission
+@@ -8763,9 +8820,7 @@ impl ThreadView {
+         // The label's markdown source is a fenced code block (```\n...\n```);
+         // strip the fences so the copy button yields just the command text.
+         let command_source = command.read(cx).source();
+-        let command_text = command_source
+-            .strip_prefix("```\n")
+-            .and_then(|s| s.strip_suffix("\n```"))
++        let command_text = acp_thread::unfence_shell_command(&command_source)
+             .unwrap_or(&command_source)
+             .to_string();
+ 
+@@ -8877,23 +8932,84 @@ impl ThreadView {
+         ));
+         let border_color = cx.theme().colors().border.opacity(0.6);
+ 
+-        let working_dir = working_dir
++        // 하네스 패치: 카드 머리에 작업 폴더 대신 그 명령의 설명(무슨 작업인지)을 보여 준다.
++        let working_dir = tool_call
++            .raw_input
+             .as_ref()
+-            .map(|path| path.display().to_string())
+-            .unwrap_or_else(|| "현재 디렉터리".to_string());
++            .and_then(|input| input.get("description"))
++            .and_then(|value| value.as_str())
++            .filter(|text| !text.trim().is_empty())
++            .map(str::to_owned)
++            .unwrap_or_else(|| {
++                working_dir
++                    .as_ref()
++                    .map(|path| path.display().to_string())
++                    .unwrap_or_else(|| "현재 디렉터리".to_string())
++            });
++
++        // 하네스 패치: 터미널 쪽 명령어(```sh)가 제목과 같으면 그쪽을 써서 셸 문법 색을 입힌다.
++        let label_markdown = {
++            let label_source = tool_call.label.read(cx).source().to_string();
++            let terminal_command = terminal.read(cx).command().clone();
++            let same = acp_thread::unfence_shell_command(terminal_command.read(cx).source())
++                == Some(label_source.as_str());
++            if same {
++                terminal_command
++            } else {
++                tool_call.label.clone()
++            }
++        };
++        let is_expanded = self
++            .entry_view_state
++            .read(cx)
++            .is_tool_call_expanded(&tool_call.id);
+ 
++        let command_line_count = label_markdown.read(cx).source().lines().count();
+         let command_element = self.render_collapsible_command(
+             header_group.clone(),
+             false,
+-            tool_call.label.clone(),
++            label_markdown,
+             window,
+             cx,
+         );
+-
+-        let is_expanded = self
+-            .entry_view_state
+-            .read(cx)
+-            .is_tool_call_expanded(&tool_call.id);
++        // 하네스 패치: 긴 명령은 접힌 카드에서 3줄만 보이고, 눌러서 펼치면 전부 보인다.
++        const FOLDED_COMMAND_LINES: usize = 3;
++        let hidden_command_lines =
++            command_line_count.saturating_sub(FOLDED_COMMAND_LINES + 2);
++        let command_element = if !is_expanded && hidden_command_lines >= 3 {
++            v_flex()
++                .child(
++                    div()
++                        .max_h(px(17. * FOLDED_COMMAND_LINES as f32 + 12.))
++                        .overflow_hidden()
++                        .child(command_element),
++                )
++                .child(
++                    div()
++                        .id(SharedString::from(format!("{}-more", tool_call.id.0)))
++                        .px_1p5()
++                        .pb_1()
++                        .cursor_pointer()
++                        .child(
++                            Label::new(format!("⋯ {hidden_command_lines}줄 더 보기"))
++                                .size(LabelSize::XSmall)
++                                .color(Color::Muted),
++                        )
++                        .on_click(cx.listener({
++                            let id = tool_call.id.clone();
++                            move |this, _event, window, cx| {
++                                this.entry_view_state.update(cx, |state, _cx| {
++                                    state.toggle_tool_call_expansion(&id);
++                                });
++                                this.refresh_thread_search(window, cx);
++                                cx.notify();
++                            }
++                        })),
++                )
++                .into_any_element()
++        } else {
++            command_element.into_any_element()
++        };
+ 
+         let truncated_tooltip = truncated_output.then(|| {
+             if let Some(output) = output {
+diff --git a/crates/agent_ui/src/thread_import.rs b/crates/agent_ui/src/thread_import.rs
+index 0fa50c0..dcddc42 100644
+--- a/crates/agent_ui/src/thread_import.rs
++++ b/crates/agent_ui/src/thread_import.rs
+@@ -881,7 +881,8 @@ fn collect_importable_threads(
+                 interacted_at: None,
+                 worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
+                 remote_connection: remote_connection.clone(),
+-                archived: true,
++                // 하네스 패치: 가져온 스레드를 보관(archived)하지 않고 사이드바에 바로 노출.
++                archived: false,
+             });
+         }
+     }
+@@ -1061,7 +1062,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_collect_marks_all_imported_threads_as_archived() {
++    fn test_collect_imports_threads_unarchived() {
+         let existing = HashSet::default();
+         let paths = PathList::new(&[Path::new("/project")]);
+ 
+@@ -1077,7 +1078,7 @@ mod tests {
+         let result = collect_importable_threads(sessions_by_agent, existing);
+ 
+         assert_eq!(result.len(), 2);
+-        assert!(result.iter().all(|t| t.archived));
++        assert!(result.iter().all(|t| !t.archived));
+     }
+ 
+     #[test]
+diff --git a/crates/agent_ui/src/thread_metadata_store.rs b/crates/agent_ui/src/thread_metadata_store.rs
+index 2c10bfd..06c0717 100644
+--- a/crates/agent_ui/src/thread_metadata_store.rs
++++ b/crates/agent_ui/src/thread_metadata_store.rs
+@@ -1292,7 +1292,14 @@ impl ThreadMetadataStore {
+         let title = thread_ref.title();
+         let title_override = existing_thread.and_then(|t| t.title_override.clone());
+ 
+-        let updated_at = Utc::now();
++        // 하네스 패치: 열기·리로드(기록 재생)로는 시각을 바꾸지 않고, 에이전트가
++        // 실제로 응답 중일 때만 updated_at 을 지금으로 올린다.
++        let updated_at = match existing_thread {
++            Some(t) if !matches!(thread_ref.status(), acp_thread::ThreadStatus::Generating) => {
++                t.updated_at
++            }
++            _ => Utc::now(),
++        };
+ 
+         let created_at = existing_thread
+             .and_then(|t| t.created_at)
+diff --git a/tmp/zed-trial/crates/canvas_editor/Cargo.toml b/crates/canvas_editor/Cargo.toml
+new file mode 100644
+index 0000000..9eed06a
+--- /dev/null
++++ b/crates/canvas_editor/Cargo.toml
+@@ -0,0 +1,28 @@
++[package]
++name = "canvas_editor"
++version = "0.1.0"
++edition.workspace = true
++publish.workspace = true
++license = "GPL-3.0-or-later"
++
++[lints]
++workspace = true
++
++[lib]
++path = "src/canvas_editor.rs"
++doctest = false
++
++[dependencies]
++anyhow.workspace = true
++editor.workspace = true
++fs.workspace = true
++gpui.workspace = true
++log.workspace = true
++project.workspace = true
++serde.workspace = true
++serde_json.workspace = true
++ui.workspace = true
++util.workspace = true
++workspace.workspace = true
++
++[dev-dependencies]
+diff --git a/tmp/zed-trial/crates/canvas_editor/src/canvas_editor.rs b/crates/canvas_editor/src/canvas_editor.rs
+new file mode 100644
+index 0000000..8ce9b44
+--- /dev/null
++++ b/crates/canvas_editor/src/canvas_editor.rs
+@@ -0,0 +1,974 @@
++// 하네스 패치: .canvas(JSON Canvas) 박스 그리기 화면 — 드래그로 박스, 아래 칸에서 글, 덱 만들기 버튼.
++mod model;
++
++use std::{
++    cell::Cell,
++    path::{Path, PathBuf},
++    rc::Rc,
++    sync::Arc,
++    time::Duration,
++};
++
++use editor::{Editor, EditorEvent};
++use fs::Fs;
++use gpui::{
++    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent,
++    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, Render,
++    ScrollDelta, ScrollWheelEvent, Subscription, Task, WeakEntity, Window, canvas, div, point, px,
++};
++use project::{Project, ProjectEntryId, ProjectPath};
++use ui::{Tooltip, prelude::*};
++use workspace::{
++    OpenOptions, Pane, Workspace,
++    item::{Item, ProjectItem},
++};
++
++use crate::model::{CanvasDoc, NodeKind, WorldRect};
++
++pub use crate::model::{SWATCHES, parse_hex};
++
++const DECK_PYTHON: &str = "/Users/lee-hong-gi/anaconda3/envs/harness-tools/bin/python";
++const DECK_SCRIPT: &str =
++    "/Users/lee-hong-gi/Desktop/codnut_main/00_System/scripts/deck/canvas_to_deck.py";
++const DECK_VAULT: &str = "/Users/lee-hong-gi/Desktop/codnut_main";
++const TEXT_WORLD_SIZE: f32 = 28.0;
++const HANDLE_PX: f32 = 12.0;
++const LABEL_BAR_PX: f32 = 26.0;
++const MIN_ZOOM: f32 = 0.05;
++const MAX_ZOOM: f32 = 4.0;
++const SCROLL_LINE: f32 = 20.0;
++const POLL: Duration = Duration::from_millis(1000);
++const STATE_FILE: &str = ".cache/harness/canvas_state.json";
++
++pub struct CanvasFile {
++    abs_path: PathBuf,
++    project_path: ProjectPath,
++    entry_id: Option<ProjectEntryId>,
++}
++
++impl project::ProjectItem for CanvasFile {
++    fn try_open(
++        project: &Entity<Project>,
++        path: &ProjectPath,
++        cx: &mut App,
++    ) -> Option<Task<anyhow::Result<Entity<Self>>>> {
++        let is_canvas = path
++            .path
++            .extension()
++            .is_some_and(|ext| ext.eq_ignore_ascii_case("canvas"));
++        if !is_canvas {
++            return None;
++        }
++        let abs_path = project.read(cx).absolute_path(path, cx)?;
++        let entry_id = project
++            .read(cx)
++            .entry_for_path(path, cx)
++            .map(|entry| entry.id);
++        let project_path = path.clone();
++        Some(Task::ready(Ok(cx.new(|_| CanvasFile {
++            abs_path,
++            project_path,
++            entry_id,
++        }))))
++    }
++
++    fn entry_id(&self, _: &App) -> Option<ProjectEntryId> {
++        self.entry_id
++    }
++
++    fn project_path(&self, _: &App) -> Option<ProjectPath> {
++        Some(self.project_path.clone())
++    }
++
++    fn is_dirty(&self) -> bool {
++        false
++    }
++}
++
++enum Drag {
++    Pan(Point<Pixels>),
++    Move {
++        targets: Vec<(usize, f64, f64)>,
++        start: (f64, f64),
++    },
++    Resize {
++        index: usize,
++        width: f64,
++        height: f64,
++        start: (f64, f64),
++    },
++    Create {
++        start: (f64, f64),
++        current: (f64, f64),
++    },
++}
++
++pub struct CanvasView {
++    file: Entity<CanvasFile>,
++    fs: Arc<dyn Fs>,
++    doc: CanvasDoc,
++    last_text: String,
++    load_error: Option<String>,
++    focus_handle: FocusHandle,
++    zoom: f32,
++    pan: Point<Pixels>,
++    fitted: bool,
++    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
++    selected: Option<String>,
++    drag: Option<Drag>,
++    editor: Entity<Editor>,
++    syncing_editor: bool,
++    status: SharedString,
++    workspace: Option<WeakEntity<Workspace>>,
++    _poll: Task<()>,
++    _subscriptions: Vec<Subscription>,
++}
++
++impl CanvasView {
++    fn new(
++        file: Entity<CanvasFile>,
++        project: Entity<Project>,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> Self {
++        let fs = project.read(cx).fs().clone();
++        let editor = cx.new(|cx| {
++            let mut editor = Editor::auto_height(2, 10, window, cx);
++            editor.set_placeholder_text(
++                "박스를 고르면 여기서 글을 고칩니다 · 이미지 / 이미지: 파일.png / 부제: … / ## 소제목 / - 글머리 / **굵게** / 색: 남색",
++                window,
++                cx,
++            );
++            editor
++        });
++        let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
++        let abs_path = file.read(cx).abs_path.clone();
++        let poll = cx.spawn_in(window, {
++            let fs = fs.clone();
++            async move |this, cx| {
++                loop {
++                    let text = fs.load(&abs_path).await;
++                    let keep_going = this
++                        .update_in(cx, |this, window, cx| this.apply_disk_text(text, window, cx))
++                        .unwrap_or(false);
++                    if !keep_going {
++                        break;
++                    }
++                    cx.background_executor().timer(POLL).await;
++                }
++            }
++        });
++        Self {
++            file,
++            fs,
++            doc: CanvasDoc::default(),
++            last_text: String::new(),
++            load_error: None,
++            focus_handle: cx.focus_handle(),
++            zoom: 0.4,
++            pan: point(px(40.), px(40.)),
++            fitted: false,
++            bounds: Rc::new(Cell::new(None)),
++            selected: None,
++            drag: None,
++            editor,
++            syncing_editor: false,
++            status: "".into(),
++            workspace: Workspace::for_window(window, cx).map(|workspace| workspace.downgrade()),
++            _poll: poll,
++            _subscriptions: vec![subscription],
++        }
++    }
++
++    fn abs_path(&self, cx: &App) -> PathBuf {
++        self.file.read(cx).abs_path.clone()
++    }
++
++    fn publish_state(&self, cx: &App) {
++        let selected = self
++            .selected
++            .as_ref()
++            .and_then(|id| self.doc.index_of(id))
++            .map(|index| {
++                let node = &self.doc.nodes[index];
++                serde_json::json!({
++                    "id": node.id,
++                    "kind": match node.kind {
++                        NodeKind::Group => "slide",
++                        NodeKind::Text => "text",
++                        NodeKind::File => "file",
++                    },
++                    "text": node.text,
++                })
++            });
++        let state = serde_json::json!({
++            "canvas": self.abs_path(cx),
++            "selected": selected,
++        });
++        let Some(home) = std::env::var_os("HOME") else {
++            return;
++        };
++        let path = PathBuf::from(home).join(STATE_FILE);
++        if let Some(parent) = path.parent() {
++            std::fs::create_dir_all(parent).ok();
++        }
++        if let Err(error) = std::fs::write(&path, state.to_string()) {
++            log::warn!("그림판 상태 기록 실패: {error:#}");
++        }
++    }
++
++    fn apply_disk_text(
++        &mut self,
++        text: anyhow::Result<String>,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> bool {
++        let text = match text {
++            Ok(text) => text,
++            Err(error) => {
++                if self.last_text.is_empty() {
++                    self.load_error = Some(format!("{error:#}"));
++                    cx.notify();
++                }
++                return true;
++            }
++        };
++        if text == self.last_text || self.drag.is_some() {
++            return true;
++        }
++        let first_load = self.last_text.is_empty();
++        match CanvasDoc::parse(&text) {
++            Ok(doc) => {
++                self.doc = doc;
++                self.last_text = text;
++                self.load_error = None;
++                if self
++                    .selected
++                    .as_ref()
++                    .is_some_and(|id| self.doc.index_of(id).is_none())
++                {
++                    self.selected = None;
++                }
++                self.sync_editor(window, cx);
++                if first_load {
++                    self.publish_state(cx);
++                }
++                cx.notify();
++            }
++            Err(error) => {
++                self.load_error = Some(format!("캔버스 형식을 못 읽음: {error:#}"));
++                cx.notify();
++            }
++        }
++        true
++    }
++
++    fn save(&mut self, cx: &mut Context<Self>) {
++        let text = self.doc.to_text();
++        if text == self.last_text {
++            return;
++        }
++        self.last_text = text.clone();
++        let fs = self.fs.clone();
++        let path = self.abs_path(cx);
++        cx.background_spawn(async move {
++            if let Err(error) = fs.atomic_write(path, text).await {
++                log::error!("캔버스 저장 실패: {error:#}");
++            }
++        })
++        .detach();
++    }
++
++    fn sync_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        let text = self
++            .selected
++            .as_ref()
++            .and_then(|id| self.doc.index_of(id))
++            .map(|index| self.doc.nodes[index].editable_text())
++            .unwrap_or_default();
++        if self.editor.read(cx).text(cx) == text {
++            return;
++        }
++        if self.editor.focus_handle(cx).is_focused(window) && self.selected.is_some() {
++            return;
++        }
++        self.syncing_editor = true;
++        self.editor
++            .update(cx, |editor, cx| editor.set_text(text, window, cx));
++        self.syncing_editor = false;
++    }
++
++    fn on_editor_event(
++        &mut self,
++        editor: &Entity<Editor>,
++        event: &EditorEvent,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if self.syncing_editor || !matches!(event, EditorEvent::BufferEdited) {
++            return;
++        }
++        let Some(index) = self.selected.as_ref().and_then(|id| self.doc.index_of(id)) else {
++            return;
++        };
++        let text = editor.read(cx).text(cx);
++        self.doc.nodes[index].set_editable_text(&text);
++        self.save(cx);
++        cx.notify();
++    }
++
++    fn select(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
++        self.selected = id;
++        self.syncing_editor = true;
++        let text = self
++            .selected
++            .as_ref()
++            .and_then(|id| self.doc.index_of(id))
++            .map(|index| self.doc.nodes[index].editable_text())
++            .unwrap_or_default();
++        self.editor
++            .update(cx, |editor, cx| editor.set_text(text, window, cx));
++        self.syncing_editor = false;
++        self.publish_state(cx);
++        cx.notify();
++    }
++
++    fn origin(&self) -> Point<Pixels> {
++        self.bounds
++            .get()
++            .map(|bounds| bounds.origin)
++            .unwrap_or_default()
++    }
++
++    fn to_world(&self, position: Point<Pixels>) -> (f64, f64) {
++        let local = position - self.origin() - self.pan;
++        (
++            (f32::from(local.x) / self.zoom) as f64,
++            (f32::from(local.y) / self.zoom) as f64,
++        )
++    }
++
++    fn to_screen(&self, x: f64, y: f64) -> Point<Pixels> {
++        point(
++            self.pan.x + px(x as f32 * self.zoom),
++            self.pan.y + px(y as f32 * self.zoom),
++        )
++    }
++
++    fn fit(&mut self) {
++        let Some(bounds) = self.bounds.get() else {
++            return;
++        };
++        let Some(extent) = self.doc.extent() else {
++            self.zoom = 0.4;
++            self.pan = point(px(40.), px(40.));
++            self.fitted = true;
++            return;
++        };
++        let width = f32::from(bounds.size.width).max(100.);
++        let height = f32::from(bounds.size.height).max(100.);
++        let margin = 40.0;
++        let zoom = ((width - margin * 2.) / extent.w as f32)
++            .min((height - margin * 2.) / (extent.h as f32 + 60.))
++            .clamp(MIN_ZOOM, 1.0);
++        self.zoom = zoom;
++        self.pan = point(
++            px(margin - extent.x as f32 * zoom),
++            px(margin + LABEL_BAR_PX - extent.y as f32 * zoom),
++        );
++        self.fitted = true;
++    }
++
++    fn set_zoom(&mut self, zoom: f32, anchor: Point<Pixels>) {
++        let zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
++        let (wx, wy) = self.to_world(anchor);
++        self.zoom = zoom;
++        let local = anchor - self.origin();
++        self.pan = point(
++            local.x - px(wx as f32 * zoom),
++            local.y - px(wy as f32 * zoom),
++        );
++    }
++
++    fn hit_handle(&self, position: Point<Pixels>) -> Option<usize> {
++        let index = self.selected.as_ref().and_then(|id| self.doc.index_of(id))?;
++        let rect = self.doc.nodes[index].rect;
++        let corner = self.to_screen(rect.x + rect.w, rect.y + rect.h) + self.origin();
++        let delta = position - corner;
++        (f32::from(delta.x).abs() <= HANDLE_PX && f32::from(delta.y).abs() <= HANDLE_PX)
++            .then_some(index)
++    }
++
++    fn hit_label(&self, position: Point<Pixels>) -> Option<usize> {
++        self.doc.nodes.iter().enumerate().rev().find_map(|(index, node)| {
++            if node.kind != NodeKind::Group {
++                return None;
++            }
++            let top_left = self.to_screen(node.rect.x, node.rect.y) + self.origin();
++            let local = position - top_left;
++            let x = f32::from(local.x);
++            let y = f32::from(local.y);
++            let width = (node.rect.w as f32 * self.zoom).max(120.);
++            (x >= 0. && x <= width && y >= -LABEL_BAR_PX && y <= 0.).then_some(index)
++        })
++    }
++
++    fn handle_mouse_down(
++        &mut self,
++        event: &MouseDownEvent,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        window.focus(&self.focus_handle, cx);
++        if event.button == MouseButton::Middle || event.modifiers.alt {
++            self.drag = Some(Drag::Pan(event.position));
++            return;
++        }
++        if event.button != MouseButton::Left {
++            return;
++        }
++        let world = self.to_world(event.position);
++        if let Some(index) = self.hit_handle(event.position) {
++            let rect = self.doc.nodes[index].rect;
++            self.drag = Some(Drag::Resize {
++                index,
++                width: rect.w,
++                height: rect.h,
++                start: world,
++            });
++            return;
++        }
++        let hit = self
++            .doc
++            .hit_content(world.0, world.1)
++            .or_else(|| self.hit_label(event.position));
++        if let Some(index) = hit {
++            let id = self.doc.nodes[index].id.clone();
++            if self.selected.as_deref() != Some(id.as_str()) {
++                self.select(Some(id), window, cx);
++            }
++            let mut targets = vec![index];
++            if self.doc.nodes[index].kind == NodeKind::Group {
++                targets.extend(self.doc.children_of(index));
++            }
++            let targets = targets
++                .into_iter()
++                .map(|i| (i, self.doc.nodes[i].rect.x, self.doc.nodes[i].rect.y))
++                .collect();
++            self.drag = Some(Drag::Move {
++                targets,
++                start: world,
++            });
++        } else {
++            self.drag = Some(Drag::Create {
++                start: world,
++                current: world,
++            });
++        }
++        cx.notify();
++    }
++
++    fn handle_mouse_move(
++        &mut self,
++        event: &MouseMoveEvent,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let world = self.to_world(event.position);
++        match &mut self.drag {
++            Some(Drag::Pan(last)) => {
++                let delta = event.position - *last;
++                *last = event.position;
++                self.pan += delta;
++            }
++            Some(Drag::Move { targets, start }) => {
++                let dx = model::snap(world.0 - start.0);
++                let dy = model::snap(world.1 - start.1);
++                for (index, x, y) in targets.iter() {
++                    self.doc.nodes[*index].rect.x = x + dx;
++                    self.doc.nodes[*index].rect.y = y + dy;
++                }
++            }
++            Some(Drag::Resize {
++                index,
++                width,
++                height,
++                start,
++            }) => {
++                let rect = &mut self.doc.nodes[*index].rect;
++                rect.w = model::snap(*width + world.0 - start.0).max(60.);
++                rect.h = model::snap(*height + world.1 - start.1).max(40.);
++            }
++            Some(Drag::Create { current, .. }) => *current = world,
++            None => return,
++        }
++        cx.notify();
++    }
++
++    fn handle_mouse_up(&mut self, _event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
++        match self.drag.take() {
++            Some(Drag::Create { start, current }) => {
++                let rect = WorldRect::from_corners(start, current);
++                if rect.w as f32 * self.zoom >= 16. && rect.h as f32 * self.zoom >= 12. {
++                    let id = self.doc.add_text(rect);
++                    self.save(cx);
++                    self.select(Some(id), window, cx);
++                    window.focus(&self.editor.focus_handle(cx), cx);
++                } else {
++                    self.select(None, window, cx);
++                }
++            }
++            Some(Drag::Move { .. }) | Some(Drag::Resize { .. }) => self.save(cx),
++            Some(Drag::Pan(_)) | None => {}
++        }
++        cx.notify();
++    }
++
++    fn handle_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
++        if event.modifiers.platform || event.modifiers.control {
++            let delta: f32 = match event.delta {
++                ScrollDelta::Pixels(pixels) => pixels.y.into(),
++                ScrollDelta::Lines(lines) => lines.y * SCROLL_LINE,
++            };
++            let factor = if delta > 0. {
++                1. + delta.abs() * 0.01
++            } else {
++                1. / (1. + delta.abs() * 0.01)
++            };
++            self.set_zoom(self.zoom * factor, event.position);
++        } else {
++            let delta = match event.delta {
++                ScrollDelta::Pixels(pixels) => pixels,
++                ScrollDelta::Lines(lines) => lines.map(|d| px(d * SCROLL_LINE)),
++            };
++            self.pan += delta;
++        }
++        cx.notify();
++    }
++
++    fn handle_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
++        self.set_zoom(self.zoom * (1. + event.delta), event.position);
++        cx.notify();
++    }
++
++    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
++        if !self.focus_handle.is_focused(window) {
++            return;
++        }
++        let key = event.keystroke.key.as_str();
++        if key == "backspace" || key == "delete" {
++            if let Some(id) = self.selected.clone() {
++                self.doc.remove(&id);
++                self.save(cx);
++                self.select(None, window, cx);
++                cx.stop_propagation();
++            }
++        } else if key == "escape" {
++            self.select(None, window, cx);
++        }
++    }
++
++    fn add_slide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        let id = self.doc.add_slide();
++        self.save(cx);
++        self.select(Some(id.clone()), window, cx);
++        if let Some(index) = self.doc.index_of(&id) {
++            let rect = self.doc.nodes[index].rect;
++            if let Some(bounds) = self.bounds.get() {
++                let width = f32::from(bounds.size.width);
++                self.zoom = ((width - 80.) / rect.w as f32).clamp(MIN_ZOOM, 1.0);
++                self.pan = point(
++                    px(40. - rect.x as f32 * self.zoom),
++                    px(40. + LABEL_BAR_PX - rect.y as f32 * self.zoom),
++                );
++            }
++        }
++        window.focus(&self.editor.focus_handle(cx), cx);
++    }
++
++    fn set_color(&mut self, color: Option<&'static str>, cx: &mut Context<Self>) {
++        let Some(index) = self.selected.as_ref().and_then(|id| self.doc.index_of(id)) else {
++            self.status = "색을 바꿀 박스나 슬라이드를 먼저 고르세요".into();
++            cx.notify();
++            return;
++        };
++        self.doc.nodes[index].set_color(color);
++        self.save(cx);
++        cx.notify();
++    }
++
++    fn build_deck(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        self.save(cx);
++        let canvas_path = self.abs_path(cx);
++        self.status = "덱 만드는 중…".into();
++        cx.notify();
++        let run = cx.background_spawn(async move { run_deck_script(&canvas_path) });
++        cx.spawn_in(window, async move |this, cx| {
++            let result = run.await;
++            this.update_in(cx, |this, window, cx| {
++                match result {
++                    Ok((message, pptx)) => {
++                        this.status = message.into();
++                        if let Some(workspace) = this.workspace.as_ref().and_then(|w| w.upgrade()) {
++                            workspace.update(cx, |workspace, cx| {
++                                workspace
++                                    .open_abs_path(pptx, OpenOptions::default(), window, cx)
++                                    .detach_and_log_err(cx);
++                            });
++                        }
++                    }
++                    Err(error) => this.status = format!("덱 만들기 실패: {error}").into(),
++                }
++                cx.notify();
++            })
++            .ok();
++        })
++        .detach();
++    }
++
++    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
++        let colors = cx.theme().colors().clone();
++        let mut swatches = h_flex().gap_1();
++        for (index, (name, hex)) in SWATCHES.iter().enumerate() {
++            let fill: Hsla = hex
++                .and_then(parse_hex)
++                .map(|value| gpui::rgb(value).into())
++                .unwrap_or(colors.text_muted);
++            swatches = swatches.child(
++                div()
++                    .id(("canvas-swatch", index))
++                    .size(px(16.))
++                    .rounded_full()
++                    .bg(fill)
++                    .border_1()
++                    .border_color(colors.border)
++                    .cursor_pointer()
++                    .tooltip(Tooltip::text(*name))
++                    .on_click(cx.listener(move |this, _, _, cx| this.set_color(*hex, cx))),
++            );
++        }
++        h_flex()
++            .w_full()
++            .px_2()
++            .py_1()
++            .gap_2()
++            .border_b_1()
++            .border_color(colors.border)
++            .bg(colors.toolbar_background)
++            .child(
++                Button::new("canvas-add-slide", "＋ 슬라이드")
++                    .label_size(LabelSize::Small)
++                    .on_click(cx.listener(|this, _, window, cx| this.add_slide(window, cx))),
++            )
++            .child(
++                Button::new("canvas-fit", "전체 보기")
++                    .label_size(LabelSize::Small)
++                    .on_click(cx.listener(|this, _, _, cx| {
++                        this.fit();
++                        cx.notify();
++                    })),
++            )
++            .child(Label::new("색").size(LabelSize::Small).color(Color::Muted))
++            .child(swatches)
++            .child(div().flex_1())
++            .child(
++                Label::new(self.status.clone())
++                    .size(LabelSize::Small)
++                    .color(Color::Muted)
++                    .truncate(),
++            )
++            .child(
++                Button::new("canvas-build-deck", "덱 만들기")
++                    .style(ButtonStyle::Filled)
++                    .label_size(LabelSize::Small)
++                    .on_click(cx.listener(|this, _, window, cx| this.build_deck(window, cx))),
++            )
++    }
++
++    fn render_nodes(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
++        let colors = cx.theme().colors().clone();
++        let accent = colors.text_accent;
++        let mut elements = Vec::new();
++        let mut order: Vec<usize> = (0..self.doc.nodes.len()).collect();
++        order.sort_by_key(|&index| self.doc.nodes[index].kind != NodeKind::Group);
++        for index in order {
++            let node = &self.doc.nodes[index];
++            let selected = self.selected.as_deref() == Some(node.id.as_str());
++            let origin = self.to_screen(node.rect.x, node.rect.y);
++            let width = px(node.rect.w as f32 * self.zoom);
++            let height = px(node.rect.h as f32 * self.zoom);
++            let tint: Option<Hsla> = node
++                .color
++                .as_deref()
++                .and_then(model::resolve_color)
++                .map(|value| gpui::rgb(value).into());
++            let line = tint.unwrap_or(colors.border);
++            let base = div()
++                .absolute()
++                .left(origin.x)
++                .top(origin.y)
++                .w(width)
++                .h(height);
++            match node.kind {
++                NodeKind::Group => {
++                    elements.push(
++                        base.border_2()
++                            .border_color(if selected { accent } else { line })
++                            .rounded_sm()
++                            .bg(colors.editor_background)
++                            .into_any_element(),
++                    );
++                    elements.push(
++                        div()
++                            .absolute()
++                            .left(origin.x)
++                            .top(origin.y - px(LABEL_BAR_PX))
++                            .h(px(LABEL_BAR_PX))
++                            .px_1()
++                            .flex()
++                            .items_center()
++                            .child(
++                                Label::new(if node.text.trim().is_empty() {
++                                    "(슬라이드 제목 없음)".to_string()
++                                } else {
++                                    node.text.clone()
++                                })
++                                .size(LabelSize::Small)
++                                .color(if selected { Color::Accent } else { Color::Default }),
++                            )
++                            .into_any_element(),
++                    );
++                }
++                NodeKind::Text | NodeKind::File => {
++                    let is_image = node.is_image();
++                    let font = px((TEXT_WORLD_SIZE * self.zoom).max(6.));
++                    let body = if node.kind == NodeKind::File {
++                        format!("🖼 {}", node.text)
++                    } else if is_image {
++                        format!("🖼 {}", node.text)
++                    } else {
++                        node.text.clone()
++                    };
++                    let mut element = base
++                        .overflow_hidden()
++                        .p(px(6. * self.zoom.max(0.3)))
++                        .text_size(font)
++                        .line_height(font * 1.45)
++                        .text_color(colors.text)
++                        .bg(colors.surface_background.opacity(0.6))
++                        .rounded_sm()
++                        .child(body);
++                    element = if is_image || node.kind == NodeKind::File {
++                        element.border_1().border_dashed().border_color(line)
++                    } else {
++                        element.border_1().border_color(line.opacity(0.7))
++                    };
++                    if let Some(tint) = tint {
++                        element = element.border_l_4().border_color(tint);
++                    }
++                    if selected {
++                        element = element.border_2().border_color(accent);
++                    }
++                    elements.push(element.into_any_element());
++                }
++            }
++            if selected {
++                let corner = self.to_screen(node.rect.x + node.rect.w, node.rect.y + node.rect.h);
++                elements.push(
++                    div()
++                        .absolute()
++                        .left(corner.x - px(HANDLE_PX / 2.))
++                        .top(corner.y - px(HANDLE_PX / 2.))
++                        .size(px(HANDLE_PX))
++                        .rounded_sm()
++                        .bg(accent)
++                        .cursor_nwse_resize()
++                        .into_any_element(),
++                );
++            }
++        }
++        if let Some(Drag::Create { start, current }) = &self.drag {
++            let rect = WorldRect::from_corners(*start, *current);
++            let origin = self.to_screen(rect.x, rect.y);
++            elements.push(
++                div()
++                    .absolute()
++                    .left(origin.x)
++                    .top(origin.y)
++                    .w(px(rect.w as f32 * self.zoom))
++                    .h(px(rect.h as f32 * self.zoom))
++                    .border_1()
++                    .border_dashed()
++                    .border_color(accent)
++                    .bg(accent.opacity(0.08))
++                    .into_any_element(),
++            );
++        }
++        elements
++    }
++}
++
++fn run_deck_script(canvas_path: &Path) -> Result<(String, PathBuf), String> {
++    let output = std::process::Command::new(DECK_PYTHON)
++        .arg(DECK_SCRIPT)
++        .arg("--canvas")
++        .arg(canvas_path)
++        .arg("--mode")
++        .arg("both")
++        .arg("--vault")
++        .arg(DECK_VAULT)
++        .output()
++        .map_err(|error| error.to_string())?;
++    if !output.status.success() {
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        let last = stderr.lines().last().unwrap_or("알 수 없는 오류").to_string();
++        return Err(last);
++    }
++    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
++    let pptx = canvas_path.with_extension("pptx");
++    let summary = stdout.split(" · /").next().unwrap_or(&stdout).to_string();
++    Ok((format!("완료 · {summary}"), pptx))
++}
++
++impl EventEmitter<()> for CanvasView {}
++
++impl Focusable for CanvasView {
++    fn focus_handle(&self, _: &App) -> FocusHandle {
++        self.focus_handle.clone()
++    }
++}
++
++impl Item for CanvasView {
++    type Event = ();
++
++    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
++        self.file
++            .read(cx)
++            .abs_path
++            .file_name()
++            .map(|name| name.to_string_lossy().to_string())
++            .unwrap_or_else(|| "캔버스".to_string())
++            .into()
++    }
++
++    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
++        Some(self.file.read(cx).abs_path.to_string_lossy().to_string().into())
++    }
++
++    fn tab_icon(&self, _: &Window, _: &App) -> Option<Icon> {
++        Some(Icon::new(IconName::Image))
++    }
++
++    fn for_each_project_item(
++        &self,
++        cx: &App,
++        f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
++    ) {
++        f(self.file.entity_id(), self.file.read(cx))
++    }
++
++    fn buffer_kind(&self, _: &App) -> workspace::item::ItemBufferKind {
++        workspace::item::ItemBufferKind::Singleton
++    }
++}
++
++impl ProjectItem for CanvasView {
++    type Item = CanvasFile;
++
++    fn for_project_item(
++        project: Entity<Project>,
++        _: Option<&Pane>,
++        item: Entity<Self::Item>,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> Self {
++        Self::new(item, project, window, cx)
++    }
++}
++
++impl Render for CanvasView {
++    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        if !self.fitted && !self.doc.nodes.is_empty() {
++            if self.bounds.get().is_some() {
++                self.fit();
++            } else {
++                cx.on_next_frame(window, |_, _, cx| cx.notify());
++            }
++        }
++        let colors = cx.theme().colors().clone();
++        let bounds_cell = self.bounds.clone();
++        let mut board = div()
++            .id("canvas-board")
++            .relative()
++            .flex_1()
++            .w_full()
++            .overflow_hidden()
++            .bg(colors.panel_background)
++            .track_focus(&self.focus_handle)
++            .on_key_down(cx.listener(Self::handle_key))
++            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
++            .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))
++            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
++            .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
++            .on_mouse_move(cx.listener(Self::handle_mouse_move))
++            .on_scroll_wheel(cx.listener(Self::handle_scroll))
++            .on_pinch(cx.listener(Self::handle_pinch))
++            .child(
++                canvas(move |bounds, _, _| bounds_cell.set(Some(bounds)), |_, _, _, _| {})
++                    .absolute()
++                    .size_full(),
++            )
++            .children(self.render_nodes(cx));
++        if let Some(error) = &self.load_error {
++            board = board.child(
++                div()
++                    .absolute()
++                    .top_2()
++                    .left_2()
++                    .child(Label::new(error.clone()).color(Color::Error)),
++            );
++        } else if self.doc.nodes.is_empty() {
++            board = board.child(
++                div().absolute().top_4().left_4().child(
++                    Label::new("「＋ 슬라이드」로 틀을 만들고, 틀 안을 드래그해서 박스를 그리세요")
++                        .color(Color::Muted),
++                ),
++            );
++        }
++        let editor_label = match self
++            .selected
++            .as_ref()
++            .and_then(|id| self.doc.index_of(id))
++            .map(|index| self.doc.nodes[index].kind)
++        {
++            Some(NodeKind::Group) => "슬라이드 제목",
++            Some(NodeKind::File) => "파일 경로",
++            Some(NodeKind::Text) => "박스 글",
++            None => "선택 없음",
++        };
++        v_flex()
++            .size_full()
++            .bg(colors.editor_background)
++            .child(self.render_toolbar(cx))
++            .child(board)
++            .child(
++                v_flex()
++                    .w_full()
++                    .px_2()
++                    .py_1()
++                    .gap_1()
++                    .border_t_1()
++                    .border_color(colors.border)
++                    .child(
++                        Label::new(editor_label)
++                            .size(LabelSize::XSmall)
++                            .color(Color::Muted),
++                    )
++                    .child(self.editor.clone()),
++            )
++    }
++}
++
++pub fn init(cx: &mut App) {
++    workspace::register_project_item::<CanvasView>(cx);
++}
+diff --git a/tmp/zed-trial/crates/canvas_editor/src/model.rs b/crates/canvas_editor/src/model.rs
+new file mode 100644
+index 0000000..0fdeceb
+--- /dev/null
++++ b/crates/canvas_editor/src/model.rs
+@@ -0,0 +1,413 @@
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use serde_json::{Map, Value, json};
++
++pub const SWATCHES: [(&str, Option<&str>); 7] = [
++    ("기본색", None),
++    ("파랑", Some("#2563eb")),
++    ("빨강", Some("#dc2626")),
++    ("초록", Some("#16a34a")),
++    ("주황", Some("#ea580c")),
++    ("보라", Some("#7c3aed")),
++    ("남색", Some("#1e3a8a")),
++];
++
++const OBSIDIAN_COLORS: [(&str, &str); 6] = [
++    ("1", "#e93147"),
++    ("2", "#ec7500"),
++    ("3", "#e0ac00"),
++    ("4", "#08b94e"),
++    ("5", "#00bfbc"),
++    ("6", "#7852ee"),
++];
++const SLIDE_W: f64 = 1600.;
++const SLIDE_H: f64 = 900.;
++const SLIDE_GAP: f64 = 150.;
++const GRID: f64 = 10.;
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct WorldRect {
++    pub x: f64,
++    pub y: f64,
++    pub w: f64,
++    pub h: f64,
++}
++
++impl WorldRect {
++    pub fn from_corners(a: (f64, f64), b: (f64, f64)) -> Self {
++        let x = snap(a.0.min(b.0));
++        let y = snap(a.1.min(b.1));
++        Self {
++            x,
++            y,
++            w: snap((a.0 - b.0).abs()),
++            h: snap((a.1 - b.1).abs()),
++        }
++    }
++
++    fn contains(&self, x: f64, y: f64) -> bool {
++        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
++    }
++
++    fn center(&self) -> (f64, f64) {
++        (self.x + self.w / 2., self.y + self.h / 2.)
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum NodeKind {
++    Group,
++    Text,
++    File,
++}
++
++#[derive(Clone, Debug)]
++pub struct Node {
++    pub id: String,
++    pub kind: NodeKind,
++    pub rect: WorldRect,
++    pub text: String,
++    pub color: Option<String>,
++    raw: Map<String, Value>,
++}
++
++impl Node {
++    pub fn editable_text(&self) -> String {
++        self.text.clone()
++    }
++
++    pub fn set_editable_text(&mut self, text: &str) {
++        self.text = text.to_string();
++    }
++
++    pub fn set_color(&mut self, color: Option<&str>) {
++        self.color = color.map(str::to_string);
++    }
++
++    pub fn is_image(&self) -> bool {
++        let body = self.text.trim();
++        self.kind == NodeKind::Text && (body == "이미지" || body.starts_with("이미지:"))
++    }
++
++    fn to_value(&self) -> Value {
++        let mut map = self.raw.clone();
++        map.insert("id".into(), json!(self.id));
++        map.insert(
++            "type".into(),
++            json!(match self.kind {
++                NodeKind::Group => "group",
++                NodeKind::Text => "text",
++                NodeKind::File => "file",
++            }),
++        );
++        map.insert("x".into(), number(self.rect.x));
++        map.insert("y".into(), number(self.rect.y));
++        map.insert("width".into(), number(self.rect.w));
++        map.insert("height".into(), number(self.rect.h));
++        let text_key = match self.kind {
++            NodeKind::Group => "label",
++            NodeKind::Text => "text",
++            NodeKind::File => "file",
++        };
++        map.insert(text_key.into(), json!(self.text));
++        match &self.color {
++            Some(color) => map.insert("color".into(), json!(color)),
++            None => map.remove("color"),
++        };
++        Value::Object(map)
++    }
++}
++
++#[derive(Default, Debug)]
++pub struct CanvasDoc {
++    pub nodes: Vec<Node>,
++    others: Vec<Value>,
++    root: Map<String, Value>,
++}
++
++impl CanvasDoc {
++    pub fn parse(text: &str) -> anyhow::Result<Self> {
++        if text.trim().is_empty() {
++            return Ok(Self::default());
++        }
++        let Value::Object(root) = serde_json::from_str::<Value>(text)? else {
++            anyhow::bail!("최상위가 객체가 아님");
++        };
++        let mut nodes = Vec::new();
++        let mut others = Vec::new();
++        for value in root
++            .get("nodes")
++            .and_then(Value::as_array)
++            .cloned()
++            .unwrap_or_default()
++        {
++            match node_from_value(&value) {
++                Some(node) => nodes.push(node),
++                None => others.push(value),
++            }
++        }
++        Ok(Self {
++            nodes,
++            others,
++            root,
++        })
++    }
++
++    pub fn to_text(&self) -> String {
++        let mut root = self.root.clone();
++        let mut values: Vec<Value> = self.nodes.iter().map(Node::to_value).collect();
++        values.extend(self.others.iter().cloned());
++        root.insert("nodes".into(), Value::Array(values));
++        root.entry("edges").or_insert_with(|| json!([]));
++        let mut out = Vec::new();
++        let formatter = serde_json::ser::PrettyFormatter::with_indent(b"\t");
++        let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
++        serde::Serialize::serialize(&Value::Object(root), &mut serializer)
++            .expect("json 직렬화는 실패하지 않음");
++        String::from_utf8(out).unwrap_or_default()
++    }
++
++    pub fn index_of(&self, id: &str) -> Option<usize> {
++        self.nodes.iter().position(|node| node.id == id)
++    }
++
++    pub fn hit_content(&self, x: f64, y: f64) -> Option<usize> {
++        self.nodes
++            .iter()
++            .enumerate()
++            .rev()
++            .find(|(_, node)| node.kind != NodeKind::Group && node.rect.contains(x, y))
++            .map(|(index, _)| index)
++    }
++
++    pub fn children_of(&self, group: usize) -> Vec<usize> {
++        let frame = self.nodes[group].rect;
++        self.nodes
++            .iter()
++            .enumerate()
++            .filter(|(index, node)| {
++                *index != group && node.kind != NodeKind::Group && {
++                    let (cx, cy) = node.rect.center();
++                    frame.contains(cx, cy)
++                }
++            })
++            .map(|(index, _)| index)
++            .collect()
++    }
++
++    pub fn extent(&self) -> Option<WorldRect> {
++        let first = self.nodes.first()?.rect;
++        let (mut x0, mut y0) = (first.x, first.y);
++        let (mut x1, mut y1) = (first.x + first.w, first.y + first.h);
++        for node in &self.nodes {
++            x0 = x0.min(node.rect.x);
++            y0 = y0.min(node.rect.y);
++            x1 = x1.max(node.rect.x + node.rect.w);
++            y1 = y1.max(node.rect.y + node.rect.h);
++        }
++        Some(WorldRect {
++            x: x0,
++            y: y0,
++            w: (x1 - x0).max(1.),
++            h: (y1 - y0).max(1.),
++        })
++    }
++
++    pub fn add_text(&mut self, rect: WorldRect) -> String {
++        let id = new_id(self.nodes.len());
++        self.nodes.push(Node {
++            id: id.clone(),
++            kind: NodeKind::Text,
++            rect,
++            text: String::new(),
++            color: None,
++            raw: Map::new(),
++        });
++        id
++    }
++
++    pub fn add_slide(&mut self) -> String {
++        let groups: Vec<WorldRect> = self
++            .nodes
++            .iter()
++            .filter(|node| node.kind == NodeKind::Group)
++            .map(|node| node.rect)
++            .collect();
++        let x = groups.iter().map(|r| r.x).fold(f64::INFINITY, f64::min);
++        let bottom = groups
++            .iter()
++            .map(|r| r.y + r.h)
++            .fold(f64::NEG_INFINITY, f64::max);
++        let (x, y) = if groups.is_empty() {
++            (0., 0.)
++        } else {
++            (x, bottom + SLIDE_GAP)
++        };
++        let id = new_id(self.nodes.len());
++        self.nodes.push(Node {
++            id: id.clone(),
++            kind: NodeKind::Group,
++            rect: WorldRect {
++                x,
++                y,
++                w: SLIDE_W,
++                h: SLIDE_H,
++            },
++            text: "새 슬라이드".into(),
++            color: None,
++            raw: Map::new(),
++        });
++        id
++    }
++
++    pub fn remove(&mut self, id: &str) {
++        self.nodes.retain(|node| node.id != id);
++    }
++}
++
++fn node_from_value(value: &Value) -> Option<Node> {
++    let map = value.as_object()?;
++    let kind = match map.get("type")?.as_str()? {
++        "group" => NodeKind::Group,
++        "text" => NodeKind::Text,
++        "file" => NodeKind::File,
++        _ => return None,
++    };
++    let get = |key: &str| map.get(key).and_then(Value::as_f64);
++    let text_key = match kind {
++        NodeKind::Group => "label",
++        NodeKind::Text => "text",
++        NodeKind::File => "file",
++    };
++    Some(Node {
++        id: map.get("id")?.as_str()?.to_string(),
++        kind,
++        rect: WorldRect {
++            x: get("x")?,
++            y: get("y")?,
++            w: get("width")?,
++            h: get("height")?,
++        },
++        text: map
++            .get(text_key)
++            .and_then(Value::as_str)
++            .unwrap_or_default()
++            .to_string(),
++        color: map.get("color").and_then(Value::as_str).map(str::to_string),
++        raw: map.clone(),
++    })
++}
++
++fn number(value: f64) -> Value {
++    if value.fract() == 0. && value.abs() < 1e15 {
++        json!(value as i64)
++    } else {
++        json!(value)
++    }
++}
++
++fn new_id(salt: usize) -> String {
++    let nanos = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_nanos())
++        .unwrap_or_default();
++    format!("{:016x}", (nanos as u64) ^ ((salt as u64) << 48))
++}
++
++pub fn snap(value: f64) -> f64 {
++    (value / GRID).round() * GRID
++}
++
++pub fn parse_hex(hex: &str) -> Option<u32> {
++    let digits = hex.trim().trim_start_matches('#');
++    let digits = match digits.len() {
++        3 => digits.chars().flat_map(|c| [c, c]).collect::<String>(),
++        6 => digits.to_string(),
++        _ => return None,
++    };
++    u32::from_str_radix(&digits, 16).ok()
++}
++
++pub fn resolve_color(color: &str) -> Option<u32> {
++    let preset = OBSIDIAN_COLORS
++        .iter()
++        .find(|(key, _)| *key == color)
++        .map(|(_, hex)| *hex);
++    parse_hex(preset.unwrap_or(color))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const SAMPLE: &str = r##"{"nodes":[
++ {"id":"g1","type":"group","x":0,"y":0,"width":1600,"height":900,"label":"제목","color":"4"},
++ {"id":"b1","type":"text","x":100,"y":320,"width":680,"height":280,"text":"내용","styleAttributes":{}},
++ {"id":"f1","type":"file","x":900,"y":320,"width":300,"height":200,"file":"chart.png"},
++ {"id":"l1","type":"link","x":0,"y":2000,"width":10,"height":10,"url":"https://a"}
++],"edges":[{"id":"e1","fromNode":"g1","toNode":"b1"}]}"##;
++
++    #[test]
++    fn round_trip_keeps_unknown_fields_and_nodes() {
++        let doc = CanvasDoc::parse(SAMPLE).unwrap();
++        assert_eq!(doc.nodes.len(), 3);
++        let text = doc.to_text();
++        let again: Value = serde_json::from_str(&text).unwrap();
++        assert_eq!(again["nodes"].as_array().unwrap().len(), 4);
++        assert_eq!(again["nodes"][1]["styleAttributes"], json!({}));
++        assert_eq!(again["nodes"][3]["url"], json!("https://a"));
++        assert_eq!(again["edges"][0]["id"], json!("e1"));
++        assert_eq!(again["nodes"][0]["label"], json!("제목"));
++        assert_eq!(again["nodes"][0]["x"], json!(0));
++    }
++
++    #[test]
++    fn moving_group_moves_children_only() {
++        let doc = CanvasDoc::parse(SAMPLE).unwrap();
++        assert_eq!(doc.children_of(0), vec![1, 2]);
++    }
++
++    #[test]
++    fn hit_prefers_content_over_group() {
++        let doc = CanvasDoc::parse(SAMPLE).unwrap();
++        assert_eq!(doc.hit_content(200., 400.), Some(1));
++        assert_eq!(doc.hit_content(50., 50.), None);
++    }
++
++    #[test]
++    fn new_slide_goes_below_last_slide() {
++        let mut doc = CanvasDoc::parse(SAMPLE).unwrap();
++        let id = doc.add_slide();
++        let node = &doc.nodes[doc.index_of(&id).unwrap()];
++        assert_eq!(node.rect, WorldRect { x: 0., y: 1050., w: 1600., h: 900. });
++        let mut empty = CanvasDoc::parse("").unwrap();
++        empty.add_slide();
++        assert_eq!(empty.nodes[0].rect.y, 0.);
++    }
++
++    #[test]
++    fn color_edit_and_removal() {
++        let mut doc = CanvasDoc::parse(SAMPLE).unwrap();
++        doc.nodes[0].set_color(None);
++        doc.nodes[1].set_color(Some("#dc2626"));
++        let again: Value = serde_json::from_str(&doc.to_text()).unwrap();
++        assert!(again["nodes"][0].get("color").is_none());
++        assert_eq!(again["nodes"][1]["color"], json!("#dc2626"));
++        assert_eq!(resolve_color("4"), Some(0x08b94e));
++        assert_eq!(resolve_color("#abc"), Some(0xaabbcc));
++        assert_eq!(resolve_color("빨강"), None);
++    }
++
++    #[test]
++    fn image_detection_and_rect_from_drag() {
++        let mut doc = CanvasDoc::default();
++        let id = doc.add_text(WorldRect::from_corners((303., 207.), (101., 98.)));
++        let node = &mut doc.nodes[0];
++        assert_eq!(node.id, id);
++        assert_eq!(node.rect, WorldRect { x: 100., y: 100., w: 200., h: 110. });
++        node.set_editable_text("이미지: chart.png");
++        assert!(node.is_image());
++        node.set_editable_text("이미지가 많다");
++        assert!(!node.is_image());
++    }
++}
+diff --git a/crates/markdown/src/markdown.rs b/crates/markdown/src/markdown.rs
+index fbd5217..ba46aa3 100644
+--- a/crates/markdown/src/markdown.rs
++++ b/crates/markdown/src/markdown.rs
+@@ -41,7 +41,8 @@ use gpui::{
+     actions, canvas, img, point, quad, relative, size,
+ };
+ use language::{
+-    Bias, CharClassifier, Language, LanguageRegistry, OffsetUtf16, ResolvedHighlights, Rope,
++    Bias, CharClassifier, HighlightId, Language, LanguageRegistry, OffsetUtf16, ResolvedHighlights,
++    Rope,
+ };
+ use parser::CodeBlockMetadata;
+ use parser::{
+@@ -1266,7 +1267,8 @@ impl Markdown {
+                 should_parse_metadata_blocks,
+             );
+             let events = parsed.events;
+-            let language_names = parsed.language_names;
++            let mut language_names = parsed.language_names;
++            language_names.extend(heredoc_language_names(&source).map(SharedString::from));
+             let paths = parsed.language_paths;
+             let root_block_starts = parsed.root_block_starts;
+             let html_blocks = parsed.html_blocks;
+@@ -1652,7 +1654,7 @@ fn compute_code_block_highlights(parsed: &ParsedMarkdown) -> CodeBlockHighlights
+             }
+             MarkdownEvent::End(MarkdownTagEnd::CodeBlock) => {
+                 if let Some(block) = pending_block.take() {
+-                    highlight_code_block(block, &mut code_block_highlights);
++                    highlight_code_block(block, &parsed.languages_by_name, &mut code_block_highlights);
+                 }
+             }
+             MarkdownEvent::Text => {
+@@ -1673,8 +1675,13 @@ fn compute_code_block_highlights(parsed: &ParsedMarkdown) -> CodeBlockHighlights
+     code_block_highlights
+ }
+ 
+-fn highlight_code_block(block: PendingCodeBlock, code_block_highlights: &mut CodeBlockHighlights) {
+-    if let [(event_index, text)] = block.texts.as_slice() {
++fn highlight_code_block(
++    block: PendingCodeBlock,
++    languages_by_name: &TreeMap<SharedString, Arc<Language>>,
++    code_block_highlights: &mut CodeBlockHighlights,
++) {
++    let is_shell = block.language.name().as_ref() == "Shell Script";
++    if !is_shell && let [(event_index, text)] = block.texts.as_slice() {
+         let resolved = block.language.highlight_text_resolved(*text, 0..text.len());
+         if !resolved.runs.is_empty() {
+             code_block_highlights.insert(*event_index, resolved);
+@@ -1687,9 +1694,12 @@ fn highlight_code_block(block: PendingCodeBlock, code_block_highlights: &mut Cod
+         text_offsets.push(combined.len());
+         combined.push_str(text);
+     }
+-    let resolved = block
++    let mut resolved = block
+         .language
+         .highlight_text_resolved(combined.as_str(), 0..combined.len());
++    if is_shell {
++        resolved = highlight_heredocs(resolved, &combined, languages_by_name);
++    }
+     if resolved.runs.is_empty() {
+         return;
+     }
+@@ -9380,3 +9390,138 @@ mod tests {
+         (324, "1. ```\n   foo\n   ```\n\n   bar\n", &["foo\n"]),
+     ];
+ }
++
++// 하네스 패치: 셸 heredoc(python3 - <<'EOF' … EOF) 본문을 그 언어 문법 색으로 칠한다.
++const HEREDOC_LANGUAGES: [(&str, &str); 5] = [
++    ("python", "py"),
++    ("node", "js"),
++    ("ruby", "rb"),
++    ("sqlite3", "sql"),
++    ("psql", "sql"),
++];
++
++fn heredoc_language_for(command: &str) -> Option<&'static str> {
++    let word = command.split_whitespace().find(|word| !word.contains('='))?;
++    let base = word.rsplit('/').next().unwrap_or(word);
++    HEREDOC_LANGUAGES
++        .iter()
++        .find(|(prefix, _)| base.starts_with(prefix))
++        .map(|(_, language)| *language)
++}
++
++fn heredoc_segments(text: &str) -> Vec<(Range<usize>, &'static str)> {
++    let mut segments = Vec::new();
++    let mut offset = 0;
++    let mut open: Option<(&'static str, String, usize)> = None;
++    for line in text.split_inclusive('\n') {
++        let line_start = offset;
++        offset += line.len();
++        let content = line.trim_end_matches(['\n', '\r']);
++        if let Some((language, delimiter, body_start)) = &open {
++            if content.trim() == delimiter {
++                if line_start > *body_start {
++                    segments.push((*body_start..line_start, *language));
++                }
++                open = None;
++            }
++            continue;
++        }
++        let Some(position) = content.find("<<") else {
++            continue;
++        };
++        let after = content[position + 2..].trim_start_matches('-').trim_start();
++        let delimiter: String = after
++            .trim_start_matches(['\'', '"'])
++            .chars()
++            .take_while(|c| c.is_alphanumeric() || *c == '_')
++            .collect();
++        if delimiter.is_empty() {
++            continue;
++        }
++        let head = &content[..position];
++        let command = head.rsplit([';', '|', '&']).next().unwrap_or(head);
++        if let Some(language) = heredoc_language_for(command) {
++            open = Some((language, delimiter, offset));
++        }
++    }
++    if let Some((language, _, body_start)) = open
++        && offset > body_start
++    {
++        segments.push((body_start..offset, language));
++    }
++    segments
++}
++
++fn heredoc_language_names(source: &str) -> impl Iterator<Item = &'static str> {
++    let mut names: Vec<&'static str> = heredoc_segments(source)
++        .into_iter()
++        .map(|(_, language)| language)
++        .collect();
++    names.sort_unstable();
++    names.dedup();
++    names.into_iter()
++}
++
++fn highlight_heredocs(
++    resolved: ResolvedHighlights,
++    text: &str,
++    languages_by_name: &TreeMap<SharedString, Arc<Language>>,
++) -> ResolvedHighlights {
++    let segments: Vec<_> = heredoc_segments(text)
++        .into_iter()
++        .filter_map(|(range, name)| {
++            languages_by_name
++                .get(&SharedString::from(name))
++                .cloned()
++                .map(|language| (range, language))
++        })
++        .collect();
++    if segments.is_empty() {
++        return resolved;
++    }
++    let mut sources = resolved.sources.clone();
++    let mut runs: Vec<(Range<usize>, HighlightId)> = Vec::new();
++    for (range, id) in resolved.runs.iter() {
++        let mut pieces = vec![range.clone()];
++        for (segment, _) in &segments {
++            pieces = pieces
++                .into_iter()
++                .flat_map(|piece| {
++                    let mut kept = Vec::new();
++                    if piece.start < segment.start {
++                        kept.push(piece.start..piece.end.min(segment.start));
++                    }
++                    if piece.end > segment.end {
++                        kept.push(piece.start.max(segment.end)..piece.end);
++                    }
++                    kept
++                })
++                .filter(|piece| piece.start < piece.end)
++                .collect();
++        }
++        runs.extend(pieces.into_iter().map(|piece| (piece, *id)));
++    }
++    for (segment, language) in segments {
++        let inner = language
++            .highlight_text_resolved(&Rope::from(&text[segment.clone()]), 0..segment.len());
++        for source in inner.sources.iter() {
++            if !sources
++                .iter()
++                .any(|(grammar, _)| Arc::ptr_eq(grammar, &source.0))
++            {
++                sources.push(source.clone());
++            }
++        }
++        runs.extend(
++            inner
++                .runs
++                .iter()
++                .map(|(range, id)| (range.start + segment.start..range.end + segment.start, *id)),
++        );
++    }
++    runs.sort_by_key(|(range, _)| range.start);
++    ResolvedHighlights {
++        sources,
++        runs: runs.into(),
++    }
++}
+diff --git a/crates/project/src/project.rs b/crates/project/src/project.rs
+index 5235a3e..34e158a 100644
+--- a/crates/project/src/project.rs
++++ b/crates/project/src/project.rs
+@@ -7170,6 +7170,22 @@ impl ProjectItem for Buffer {
+         path: &ProjectPath,
+         cx: &mut App,
+     ) -> Option<Task<Result<Entity<Self>>>> {
++        // 하네스 패치: html 은 에디터 대신 문서 뷰어(InvalidItemView)로 보낸다.
++        // Internal 에러를 반환하면 for_broken_project_item 경로로 떨어진다.
++        let is_html = project
++            .read(cx)
++            .absolute_path(path, cx)
++            .and_then(|p| {
++                p.extension()
++                    .and_then(|e| e.to_str())
++                    .map(|e| e.to_ascii_lowercase())
++            })
++            .is_some_and(|e| e == "html" || e == "htm");
++        if is_html {
++            return Some(Task::ready(Err(anyhow::anyhow!(
++                "opened in document viewer"
++            ))));
++        }
+         Some(project.update(cx, |project, cx| project.open_buffer(path.clone(), cx)))
+     }
+ 
+diff --git a/crates/sidebar/src/sidebar.rs b/crates/sidebar/src/sidebar.rs
+index 68e3099..0e75141 100644
+--- a/crates/sidebar/src/sidebar.rs
++++ b/crates/sidebar/src/sidebar.rs
+@@ -68,7 +68,8 @@ use util::path_list::PathList;
+ use workspace::{
+     CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
+     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
+-    ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
++    ProjectGroup, ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar,
++    SidebarSide, Toast,
+     ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+ };
+ 
+@@ -212,6 +213,7 @@ struct ActiveThreadInfo {
+     is_background: bool,
+     is_title_generating: bool,
+     diff_stats: DiffStats,
++    activity: Option<SharedString>,
+ }
+ 
+ #[derive(Clone)]
+@@ -365,6 +367,7 @@ struct ThreadEntry {
+     highlight_positions: Vec<usize>,
+     worktrees: Vec<ThreadItemWorktreeInfo>,
+     diff_stats: DiffStats,
++    activity: Option<SharedString>,
+ }
+ 
+ #[derive(Clone)]
+@@ -391,6 +394,7 @@ impl ThreadEntry {
+         self.is_background = info.is_background;
+         self.is_title_generating = info.is_title_generating;
+         self.diff_stats = info.diff_stats;
++        self.activity = info.activity.clone();
+     }
+ }
+ 
+@@ -1436,8 +1440,22 @@ impl Sidebar {
+             let agent = Agent::from(agent_id.clone());
+             let icon = match agent {
+                 Agent::NativeAgent => IconName::ZedAgent,
+-                Agent::Custom { .. } => IconName::Terminal,
+-
++                // 하네스 패치: 스레드 줄 아이콘을 에이전트별 로고로(Claude/Codex/Gemini).
++                Agent::Custom { id } => {
++                    let name = id.0.to_lowercase();
++                    if name.contains("claude") {
++                        IconName::AiClaude
++                    } else if name.contains("codex")
++                        || name.contains("gpt")
++                        || name.contains("openai")
++                    {
++                        IconName::AiOpenAi
++                    } else if name.contains("gemini") {
++                        IconName::AiGemini
++                    } else {
++                        IconName::Terminal
++                    }
++                }
+                 _ => IconName::ZedAgent,
+             };
+             let icon_from_external_svg = agent_server_store
+@@ -1446,7 +1464,48 @@ impl Sidebar {
+             (icon, icon_from_external_svg)
+         };
+ 
+-        let groups = mw.project_groups(cx);
++        let mut groups = mw.project_groups(cx);
++        // 하네스 패치: 열린 프로젝트뿐 아니라 '모든 프로젝트'의 세션을 사이드바에 표시한다.
++        // 저장된 스레드가 가리키지만 열려있지 않은 프로젝트는 합성 그룹으로 추가한다.
++        // (workspaces 비어있음 → resolve_workspace 가 Closed 로 처리, 클릭하면 그 프로젝트를 연다)
++        {
++            let store = ThreadMetadataStore::global(cx).read(cx);
++            let mut seen: HashSet<ProjectGroupKey> =
++                groups.iter().map(|group| group.key.clone()).collect();
++            let mut extra: Vec<ProjectGroupKey> = Vec::new();
++            for metadata in store.entries() {
++                if metadata.archived {
++                    continue;
++                }
++                let mut paths = metadata.main_worktree_paths().clone();
++                if paths.is_empty() {
++                    paths = metadata.folder_paths().clone();
++                }
++                if paths.is_empty() {
++                    continue;
++                }
++                // 하네스 패치: codnut 작업 세션만 노출한다. codnut_main 트리 밖
++                // (개인 레포: artemis, gisa-generator 등)은 사이드바에서 제외.
++                if !paths
++                    .paths()
++                    .iter()
++                    .any(|p| p.to_string_lossy().contains("/codnut_main"))
++                {
++                    continue;
++                }
++                let key = ProjectGroupKey::new(metadata.remote_connection.clone(), paths);
++                if seen.insert(key.clone()) {
++                    extra.push(key);
++                }
++            }
++            for key in extra {
++                groups.push(ProjectGroup {
++                    key,
++                    workspaces: Vec::new(),
++                    expanded: true,
++                });
++            }
++        }
+         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+         for workspace in &workspaces {
+             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+@@ -1641,6 +1700,7 @@ impl Sidebar {
+                             highlight_positions: Vec::new(),
+                             worktrees,
+                             diff_stats: DiffStats::default(),
++                            activity: None,
+                         })
+                     };
+ 
+@@ -5860,7 +5920,9 @@ impl Sidebar {
+     }
+ 
+     fn thread_display_time(metadata: &ThreadMetadata) -> DateTime<Utc> {
+-        metadata.interacted_at.unwrap_or(metadata.updated_at)
++        // 하네스 패치: 세션을 여는 시각(interacted_at)이 아니라 '마지막 채팅 시각'
++        // (updated_at)으로 표시·정렬한다. 클릭만으로 "1m"이 되지 않게.
++        metadata.updated_at
+     }
+ 
+     fn push_entries_by_display_time(
+@@ -5887,6 +5949,32 @@ impl Sidebar {
+             .chain(threads.into_iter().map(ListEntry::Thread))
+             .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+ 
++        // 하네스 패치: ~/.config/claude-acp/session-exclude.txt 의 패턴이 제목에 들어간
++        // 스레드는 사이드바에서 숨긴다(Codex 재가져오기로 쓰레기 스레드가 되살아나도 안 보이게).
++        let exclude: Vec<String> = std::env::var_os("HOME")
++            .and_then(|home| {
++                std::fs::read_to_string(
++                    std::path::Path::new(&home).join(".config/claude-acp/session-exclude.txt"),
++                )
++                .ok()
++            })
++            .map(|text| {
++                text.lines()
++                    .map(str::trim)
++                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
++                    .map(String::from)
++                    .collect()
++            })
++            .unwrap_or_default();
++        let row_entries = row_entries.filter(|entry| match entry {
++            ListEntry::Thread(thread) if thread.draft.is_none() => {
++                let title = thread.metadata.display_title();
++                let title = title.trim();
++                title != "login" && !exclude.iter().any(|pattern| title.contains(pattern.as_str()))
++            }
++            _ => true,
++        });
++
+         for entry in row_entries {
+             if let ListEntry::Thread(thread) = &entry {
+                 if let Some(session_id) = &thread.metadata.session_id {
+@@ -6322,6 +6410,8 @@ impl Sidebar {
+ 
+         let timestamp: SharedString = if is_empty_draft {
+             SharedString::default()
++        } else if let Some(activity) = thread.activity.clone() {
++            activity
+         } else {
+             format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
+         };
+@@ -6350,6 +6440,10 @@ impl Sidebar {
+             .when(is_draft, |this| {
+                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
+             })
++            // 하네스 패치: Claude 로고는 Claude 주황색으로 칠한다.
++            .when(!is_draft && icon == IconName::AiClaude, |this| {
++                this.icon_color(Color::Custom(gpui::rgb(0xD97757).into()))
++            })
+             .status(thread.status)
+             .is_remote(is_remote)
+             .when_some(icon_svg, |this, svg| {
+@@ -8179,6 +8273,32 @@ fn all_thread_infos_for_workspace(
+ 
+             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
+ 
++            // 하네스 패치: 응답 중인 스레드는 시간 자리에 지금 하는 일을 보여 준다.
++            let activity = Some(())
++                .map(|_| {
++                    let lines = if status == AgentThreadStatus::Running {
++                        thread.activity_lines(cx)
++                    } else {
++                        thread.background_activity_lines(cx)
++                    };
++                    lines
++                        .iter()
++                        .find(|line| line.starts_with('◐'))
++                        .or_else(|| lines.iter().find(|line| line.starts_with('▸')))
++                        .or_else(|| lines.first())
++                        .map(|line| {
++                            if line.chars().count() > 36 {
++                                SharedString::from(format!(
++                                    "{}…",
++                                    line.chars().take(36).collect::<String>()
++                                ))
++                            } else {
++                                line.clone()
++                            }
++                        })
++                })
++                .flatten();
++
+             Some(ActiveThreadInfo {
+                 session_id,
+                 title,
+@@ -8188,6 +8308,7 @@ fn all_thread_infos_for_workspace(
+                 is_background,
+                 is_title_generating,
+                 diff_stats,
++                activity,
+             })
+         });
+ 
+diff --git a/crates/sidebar/src/sidebar_tests.rs b/crates/sidebar/src/sidebar_tests.rs
+index 97bdd60..aedd0c4 100644
+--- a/crates/sidebar/src/sidebar_tests.rs
++++ b/crates/sidebar/src/sidebar_tests.rs
+@@ -1535,6 +1535,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
+             highlight_positions: Vec::new(),
+             worktrees: Vec::new(),
+             diff_stats: DiffStats::default(),
++            activity: None,
+         }))
+     };
+ 
+@@ -1627,6 +1628,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
+                 highlight_positions: Vec::new(),
+                 worktrees: Vec::new(),
+                 diff_stats: DiffStats::default(),
++                activity: None,
+             })),
+             // Active thread with Running status
+             ListEntry::Thread(Arc::new(ThreadEntry {
+@@ -1654,6 +1656,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
+                 highlight_positions: Vec::new(),
+                 worktrees: Vec::new(),
+                 diff_stats: DiffStats::default(),
++                activity: None,
+             })),
+             // Active thread with Error status
+             ListEntry::Thread(Arc::new(ThreadEntry {
+@@ -1681,6 +1684,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
+                 highlight_positions: Vec::new(),
+                 worktrees: Vec::new(),
+                 diff_stats: DiffStats::default(),
++                activity: None,
+             })),
+             // Thread with WaitingForConfirmation status, not active
+             // remote_connection: None,
+@@ -1709,6 +1713,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
+                 highlight_positions: Vec::new(),
+                 worktrees: Vec::new(),
+                 diff_stats: DiffStats::default(),
++                activity: None,
+             })),
+             // Background thread that completed (should show notification)
+             // remote_connection: None,
+@@ -1737,6 +1742,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
+                 highlight_positions: Vec::new(),
+                 worktrees: Vec::new(),
+                 diff_stats: DiffStats::default(),
++                activity: None,
+             })),
+             // Collapsed project header
+             ListEntry::ProjectHeader {
+diff --git a/crates/title_bar/Cargo.toml b/crates/title_bar/Cargo.toml
+index 57aceb8..c9cffc4 100644
+--- a/crates/title_bar/Cargo.toml
++++ b/crates/title_bar/Cargo.toml
+@@ -37,6 +37,7 @@ platform_title_bar.workspace = true
+ call.workspace = true
+ channel.workspace = true
+ chrono.workspace = true
++log.workspace = true
+ client.workspace = true
+ cloud_api_types.workspace = true
+ command_palette_hooks.workspace = true
+diff --git a/crates/title_bar/src/title_bar.rs b/crates/title_bar/src/title_bar.rs
+index fe8c9e3..f9723b1 100644
+--- a/crates/title_bar/src/title_bar.rs
++++ b/crates/title_bar/src/title_bar.rs
+@@ -404,6 +404,7 @@ impl Render for TitleBar {
+                             ),
+                     )
+                 })
++                .child(self.render_canvas_button(cx))
+                 .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
+                     this.child(self.render_user_menu_button(cx))
+                 })
+@@ -1216,6 +1217,30 @@ impl TitleBar {
+             })
+     }
+ 
++    // 하네스 패치: 프로필 옆 그림판 버튼 — 오늘 날짜 캔버스를 가운데 편집 영역에 연다(없으면 만든다).
++    fn render_canvas_button(&self, _cx: &mut Context<Self>) -> impl IntoElement {
++        let workspace = self.workspace.clone();
++        IconButton::new("harness-canvas", IconName::Pencil)
++            .icon_size(IconSize::Small)
++            .tooltip(Tooltip::text("그림판 열기 (오늘 캔버스)"))
++            .on_click(move |_, window, cx| {
++                let Some(path) = todays_canvas_path() else {
++                    return;
++                };
++                if let Err(error) = ensure_canvas_file(&path) {
++                    log::error!("캔버스 파일 만들기 실패: {error:#}");
++                    return;
++                }
++                workspace
++                    .update(cx, |workspace, cx| {
++                        workspace
++                            .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
++                            .detach_and_log_err(cx);
++                    })
++                    .ok();
++            })
++    }
++
+     pub fn render_user_menu_button(&mut self, cx: &mut Context<Self>) -> impl Element {
+         let show_update_button = self.update_version.read(cx).show_update_in_menu_bar();
+ 
+@@ -1489,3 +1514,26 @@ mod tests {
+         );
+     }
+ }
++
++const CANVAS_DIR: &str = "Desktop/codnut_main/00_System/canvas";
++const CANVAS_TEMPLATE: &str = "{\n\t\"nodes\": [\n\t\t{\"id\": \"slide1\", \"type\": \"group\", \"x\": 0, \"y\": 0, \"width\": 1600, \"height\": 900, \"label\": \"새 슬라이드\"}\n\t],\n\t\"edges\": []\n}\n";
++
++fn todays_canvas_path() -> Option<std::path::PathBuf> {
++    let home = std::env::var("HOME").ok()?;
++    let today = chrono::Local::now().format("%y%m%d").to_string();
++    Some(
++        std::path::PathBuf::from(home)
++            .join(CANVAS_DIR)
++            .join(format!("{today}_캔버스.canvas")),
++    )
++}
++
++fn ensure_canvas_file(path: &Path) -> std::io::Result<()> {
++    if path.exists() {
++        return Ok(());
++    }
++    if let Some(parent) = path.parent() {
++        std::fs::create_dir_all(parent)?;
++    }
++    std::fs::write(path, CANVAS_TEMPLATE)
++}
+diff --git a/crates/workspace/src/invalid_item_view.rs b/crates/workspace/src/invalid_item_view.rs
+index 38e100a..91c6a69 100644
+--- a/crates/workspace/src/invalid_item_view.rs
++++ b/crates/workspace/src/invalid_item_view.rs
+@@ -1,6 +1,13 @@
+-use std::{path::Path, sync::Arc};
++use std::{
++    path::{Path, PathBuf},
++    sync::Arc,
++    time::{Duration, SystemTime},
++};
+ 
+-use gpui::{EventEmitter, FocusHandle, Focusable};
++use gpui::{
++    AppContext, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent,
++    MouseMoveEvent, PinchEvent, ScrollHandle, StatefulInteractiveElement, div, img, relative,
++};
+ use ui::{
+     App, Button, ButtonCommon, ButtonStyle, Clickable, Context, FluentBuilder, InteractiveElement,
+     KeyBinding, Label, LabelCommon, LabelSize, ParentElement, Render, SharedString, Styled as _,
+@@ -10,6 +17,75 @@ use zed_actions::workspace::OpenWithSystem;
+ 
+ use crate::Item;
+ 
++// 하네스 패치: pdf/hwp/엑셀 등은 "열 수 없음" 대신 docview로 변환해 지면 이미지로 보여준다.
++const DOCVIEW_PY: &str =
++    "/Users/lee-hong-gi/Desktop/codnut_main/00_System/scripts/docview/docview.py";
++const DOCVIEW_PYTHON: &str = "/Users/lee-hong-gi/anaconda3/envs/harness-tools/bin/python";
++const DOC_EXTS: &[&str] = &[
++    "pdf", "hwp", "hwpx", "xls", "xlsx", "doc", "docx", "ppt", "pptx", "html", "htm",
++];
++
++#[derive(Debug)]
++enum DocView {
++    /// 문서 형식 아님 — 기존 "열 수 없음" 화면.
++    NotDoc,
++    /// 변환 대기(첫 렌더에서 시작).
++    Pending,
++    /// 변환 중.
++    Converting,
++    /// 변환 완료 — 페이지 이미지들.
++    Ready(Vec<Arc<Path>>),
++    /// 변환 실패 — 기존 화면으로 폴백.
++    Failed,
++}
++
++// 하네스 패치: 원본이 바뀌면 다시 변환하려고 수정 시각을 2초마다 본다.
++const DOC_WATCH_INTERVAL: Duration = Duration::from_secs(2);
++
++struct DocWatch(#[allow(dead_code)] gpui::Task<()>);
++
++impl std::fmt::Debug for DocWatch {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("DocWatch")
++    }
++}
++
++fn modified_at(path: &Path) -> Option<SystemTime> {
++    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
++}
++
++fn is_doc(path: &Path) -> bool {
++    path.extension()
++        .and_then(|e| e.to_str())
++        .map(|e| DOC_EXTS.contains(&e.to_lowercase().as_str()))
++        .unwrap_or(false)
++}
++
++/// docview 실행 후 생성된 페이지 PNG 경로들을 반환(블로킹, 백그라운드에서 호출).
++fn run_docview(path: &Path) -> Option<Vec<Arc<Path>>> {
++    std::process::Command::new(DOCVIEW_PYTHON)
++        .arg(DOCVIEW_PY)
++        .arg(path)
++        .output()
++        .ok()?;
++    let home = std::env::var("HOME").ok()?;
++    let stem = path.file_stem()?.to_string_lossy().to_string();
++    let dir = PathBuf::from(home)
++        .join(".cache/docview")
++        .join(format!("{stem}_pages"));
++    let mut pages: Vec<PathBuf> = std::fs::read_dir(&dir)
++        .ok()?
++        .filter_map(|e| e.ok())
++        .map(|e| e.path())
++        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("png"))
++        .collect();
++    pages.sort();
++    if pages.is_empty() {
++        return None;
++    }
++    Some(pages.into_iter().map(|p| Arc::from(p.as_path())).collect())
++}
++
+ /// A view to display when a certain buffer/image/other item fails to open.
+ #[derive(Debug)]
+ pub struct InvalidItemView {
+@@ -18,7 +94,15 @@ pub struct InvalidItemView {
+     /// An error message, happened when opening the item.
+     pub error: SharedString,
+     is_local: bool,
++    doc: DocView,
++    current_page: usize,
++    zoom: f32,
++    scroll_handle: ScrollHandle,
++    pan: Option<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)>,
+     focus_handle: FocusHandle,
++    refreshing: bool,
++    source_modified: Option<SystemTime>,
++    watch: Option<DocWatch>,
+ }
+ 
+ impl InvalidItemView {
+@@ -29,11 +113,71 @@ impl InvalidItemView {
+         _: &mut Window,
+         cx: &mut App,
+     ) -> Self {
++        let doc = if is_local && is_doc(abs_path) {
++            DocView::Pending
++        } else {
++            DocView::NotDoc
++        };
+         Self {
+             is_local,
+             abs_path: Arc::from(abs_path),
+             error: format!("{}", e.root_cause()).into(),
++            doc,
++            current_page: 0,
++            zoom: 1.0,
++            scroll_handle: ScrollHandle::new(),
++            pan: None,
+             focus_handle: cx.focus_handle(),
++            refreshing: false,
++            source_modified: None,
++            watch: None,
++        }
++    }
++
++    fn start_convert(&mut self, cx: &mut Context<Self>) {
++        if self.refreshing || matches!(self.doc, DocView::Converting) {
++            return;
++        }
++        if matches!(self.doc, DocView::Ready(_)) {
++            self.refreshing = true;
++        } else {
++            self.doc = DocView::Converting;
++        }
++        self.source_modified = modified_at(&self.abs_path);
++        let path = self.abs_path.clone();
++        let convert = cx.background_spawn(async move { run_docview(&path) });
++        cx.spawn(async move |this, cx| {
++            let result = convert.await;
++            this.update(cx, |this, cx| {
++                this.refreshing = false;
++                match result {
++                    Some(pages) => {
++                        this.current_page = this.current_page.min(pages.len().saturating_sub(1));
++                        this.doc = DocView::Ready(pages);
++                    }
++                    None if matches!(this.doc, DocView::Ready(_)) => {}
++                    None => this.doc = DocView::Failed,
++                }
++                cx.notify();
++            })
++            .ok();
++        })
++        .detach();
++        if self.watch.is_none() {
++            self.watch = Some(DocWatch(cx.spawn(async move |this, cx| {
++                loop {
++                    cx.background_executor().timer(DOC_WATCH_INTERVAL).await;
++                    let alive = this.update(cx, |this, cx| {
++                        let now = modified_at(&this.abs_path);
++                        if now.is_some() && now != this.source_modified {
++                            this.start_convert(cx);
++                        }
++                    });
++                    if alive.is_err() {
++                        break;
++                    }
++                }
++            })));
+         }
+     }
+ }
+@@ -77,6 +221,120 @@ impl Focusable for InvalidItemView {
+ 
+ impl Render for InvalidItemView {
+     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
++        // 문서면 변환을 시작한다(첫 렌더).
++        if matches!(self.doc, DocView::Pending) {
++            self.start_convert(cx);
++        }
++
++        // 변환된 이미지가 있으면 한 페이지씩 보여주고 좌우 버튼으로 넘긴다.
++        if let DocView::Ready(pages) = &self.doc {
++            let n = pages.len();
++            let cur = self.current_page.min(n.saturating_sub(1));
++            let page = pages[cur].clone();
++            return v_flex()
++                .size_full()
++                .track_focus(&self.focus_handle(cx))
++                .key_context("InvalidItem")
++                .child(
++                    h_flex()
++                        .flex_none()
++                        .justify_center()
++                        .items_center()
++                        .gap_4()
++                        .p_2()
++                        .child(
++                            Button::new("doc-prev", "◀ 이전").on_click(cx.listener(
++                                |this, _, _, cx| {
++                                    if this.current_page > 0 {
++                                        this.current_page -= 1;
++                                        cx.notify();
++                                    }
++                                },
++                            )),
++                        )
++                        .child(Label::new(format!("{} / {}", cur + 1, n)))
++                        .child(Button::new("doc-next", "다음 ▶").on_click(cx.listener(
++                            move |this, _, _, cx| {
++                                if this.current_page + 1 < n {
++                                    this.current_page += 1;
++                                    cx.notify();
++                                }
++                            },
++                        )))
++                        .child(Label::new("｜"))
++                        .child(Button::new("doc-zoom-out", "축소 −").on_click(cx.listener(
++                            |this, _, _, cx| {
++                                this.zoom = (this.zoom - 0.25).max(0.5);
++                                cx.notify();
++                            },
++                        )))
++                        .child(Label::new(format!("{}%", (self.zoom * 100.0) as i32)))
++                        .child(Button::new("doc-zoom-in", "확대 ＋").on_click(cx.listener(
++                            |this, _, _, cx| {
++                                this.zoom = (this.zoom + 0.25).min(5.0);
++                                cx.notify();
++                            },
++                        )))
++                        .child(Label::new("｜"))
++                        .child(
++                            Button::new(
++                                "doc-refresh",
++                                if self.refreshing { "새로고침 중…" } else { "↻ 새로고침" },
++                            )
++                            .on_click(cx.listener(|this, _, _, cx| {
++                                this.start_convert(cx);
++                                cx.notify();
++                            })),
++                        )
++                        .child(
++                            Button::new("doc-open-ext", "🌐 브라우저에서 열기").on_click(
++                                cx.listener(|this, _, _, cx| {
++                                    cx.open_with_system(&this.abs_path);
++                                }),
++                            ),
++                        ),
++                )
++                .child(
++                    div()
++                        .id("doc-scroll")
++                        .flex_1()
++                        .size_full()
++                        .overflow_scroll()
++                        .track_scroll(&self.scroll_handle)
++                        .on_mouse_down(
++                            MouseButton::Left,
++                            cx.listener(|this, e: &MouseDownEvent, _, _| {
++                                this.pan = Some((e.position, this.scroll_handle.offset()));
++                            }),
++                        )
++                        .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
++                            if let Some((start_mouse, start_offset)) = this.pan {
++                                if e.pressed_button == Some(MouseButton::Left) {
++                                    let delta = e.position - start_mouse;
++                                    this.scroll_handle.set_offset(start_offset + delta);
++                                    cx.notify();
++                                } else {
++                                    this.pan = None;
++                                }
++                            }
++                        }))
++                        .on_mouse_up(
++                            MouseButton::Left,
++                            cx.listener(|this, _, _, _| {
++                                this.pan = None;
++                            }),
++                        )
++                        // 하네스 패치: 트랙패드 핀치로 확대·축소.
++                        .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| {
++                            this.zoom = (this.zoom * (1.0 + e.delta)).clamp(0.5, 5.0);
++                            cx.notify();
++                        }))
++                        .child(img(page).w(relative(self.zoom)).flex_shrink_0()),
++                )
++                .into_any_element();
++        }
++
++        let converting = matches!(self.doc, DocView::Converting);
+         let abs_path = self.abs_path.clone();
+         v_flex()
+             .size_full()
+@@ -90,13 +348,18 @@ impl Render for InvalidItemView {
+                     v_flex()
+                         .justify_center()
+                         .gap_2()
+-                        .child(h_flex().justify_center().child("파일을 열 수 없습니다"))
+-                        .child(
+-                            h_flex()
+-                                .justify_center()
+-                                .child(Label::new(self.error.clone()).size(LabelSize::Small)),
+-                        )
+-                        .when(self.is_local, |contents| {
++                        .when(converting, |c| {
++                            c.child(h_flex().justify_center().child("문서 여는 중…"))
++                        })
++                        .when(!converting, |c| {
++                            c.child(h_flex().justify_center().child("파일을 열 수 없습니다"))
++                                .child(
++                                    h_flex().justify_center().child(
++                                        Label::new(self.error.clone()).size(LabelSize::Small),
++                                    ),
++                                )
++                        })
++                        .when(self.is_local && !converting, |contents| {
+                             contents.child(
+                                 h_flex().justify_center().child(
+                                     Button::new("open-with-system", "기본 앱으로 열기")
+@@ -110,5 +373,6 @@ impl Render for InvalidItemView {
+                         }),
+                 ),
+             )
++            .into_any_element()
+     }
+ }
+diff --git a/crates/workspace/src/pane.rs b/crates/workspace/src/pane.rs
+index 38c1dc7..8acfb00 100644
+--- a/crates/workspace/src/pane.rs
++++ b/crates/workspace/src/pane.rs
+@@ -3020,7 +3020,7 @@ impl Pane {
+                     match show_close_button {
+                         ShowCloseButton::Always => IconButton::new("탭 닫기", IconName::Close),
+                         ShowCloseButton::Hover => {
+-                            IconButton::new("close tab", IconName::Close).visible_on_hover("")
++                            IconButton::new("탭 닫기", IconName::Close).visible_on_hover("")
+                         }
+                         ShowCloseButton::Hidden => return this,
+                     }
+@@ -3136,7 +3136,7 @@ impl Pane {
+                     if let Some(pane) = pane.upgrade() {
+                         menu = menu
+                             .entry(
+-                                "Close",
++                                "닫기",
+                                 Some(Box::new(close_active_item_action)),
+                                 window.handler_for(&pane, move |pane, window, cx| {
+                                     pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+diff --git a/crates/zed/Cargo.toml b/crates/zed/Cargo.toml
+index 496e016..12339f9 100644
+--- a/crates/zed/Cargo.toml
++++ b/crates/zed/Cargo.toml
+@@ -141,6 +141,7 @@ tempfile = { workspace = true, optional = true }
+ edit_prediction.workspace = true
+ edit_prediction_ui.workspace = true
+ http_client.workspace = true
++canvas_editor.workspace = true
+ image_viewer.workspace = true
+ input_latency_ui.workspace = true
+ inspector_ui.workspace = true
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index 4089c5d..4ceacec 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -730,6 +730,8 @@ fn main() {
+ 
+         editor::init(cx);
+         image_viewer::init(cx);
++        // 하네스 패치: .canvas 를 박스 그리기 화면으로 연다.
++        canvas_editor::init(cx);
+         repl::notebook::init(cx);
+         diagnostics::init(cx);
+ 

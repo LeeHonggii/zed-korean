@@ -1,0 +1,544 @@
+diff --git a/src/acp-agent.ts b/src/acp-agent.ts
+index 90a8254..81e4198 100644
+--- a/src/acp-agent.ts
++++ b/src/acp-agent.ts
+@@ -154,6 +154,7 @@ import type {
+   RenameSessionRequest,
+   SessionIdRequest,
+ } from "./session-index/service.js";
++import { isAutomationHidden, isExcludedTitle } from "./session-index/exclude-filter.js";
+ import type {
+   ListSubscribeRequest,
+   ListUnsubscribeRequest,
+@@ -164,6 +165,8 @@ import {
+   backgroundedBashToolCallIds,
+   clientSupportsAsyncTasks,
+ } from "./async-tasks.js";
++import { HarnessActivity } from "./harness-activity.js";
++import { bangCommand, runBangCommand } from "./harness-bash.js";
+ import {
+   AUTH_STATUS_PROBE_TIMEOUT_MS,
+   AUTH_STATUS_UPDATE_METHOD,
+@@ -221,6 +224,7 @@ import {
+   readResumedSession,
+   readResumedTail,
+   type ResumedSessionSnapshot,
++  getFullSessionMessages,
+ } from "./resumed-session.js";
+ import { SessionTiming } from "./session-timing.js";
+ import { ALLOW_BYPASS } from "./permissions/modes.js";
+@@ -1483,6 +1487,8 @@ export type Session = {
+   /** Session-owned async task controller. Prompt cancellation intentionally
+    *  does not finish it because background work may outlive a prompt. */
+   asyncTaskRuntime?: AsyncTaskRuntime;
++  harnessActivity?: HarnessActivity;
++  harnessBashContext?: string;
+   /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
+    *  hand it the retained summary. */
+   contextCompaction?: ContextCompactionLifecycle;
+@@ -3244,13 +3250,17 @@ export class ClaudeAcpAgent {
+       offset,
+     });
+     const page = this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
++    const hideAutomation = isAutomationHidden();
+     const visible = [];
+     for (const session of page) {
+       if (!session.cwd) continue;
++      const title = sanitizeTitle(session.summary);
++      // 하네스 패치: 자동화 세션(블로그·논문·Reflector·Curator·/usage 등) 숨김.
++      if (hideAutomation && (isExcludedTitle(session.summary) || isExcludedTitle(title))) continue;
+       visible.push({
+         sessionId: session.sessionId,
+         cwd: session.cwd,
+-        title: sanitizeTitle(session.summary),
++        title,
+         updatedAt: new Date(session.lastModified).toISOString(),
+       });
+     }
+@@ -3827,6 +3837,24 @@ export class ClaudeAcpAgent {
+    * outcome of a turn is field for field a v1 prompt response.
+    */
+   async prompt(params: PromptRequest): Promise<PromptResponse> {
++    const session = this.sessions[params.sessionId];
++    const bang = session ? bangCommand(params.prompt) : undefined;
++    if (session && bang !== undefined) {
++      const record = await runBangCommand(bang, session.cwd, async (update) =>
++        this.client.sessionUpdate(
++          asSdkSessionNotification({ sessionId: params.sessionId, update }),
++        ),
++      );
++      session.harnessBashContext = (session.harnessBashContext ?? "") + record;
++      return { stopReason: "end_turn" } as PromptResponse;
++    }
++    if (session?.harnessBashContext) {
++      params = {
++        ...params,
++        prompt: [{ type: "text", text: session.harnessBashContext }, ...params.prompt],
++      };
++      session.harnessBashContext = undefined;
++    }
+     let events!: TurnEvents;
+     const outcome = new Promise<TurnOutcome>((resolve, reject) => {
+       events = { inserted() {}, ended: resolve, failed: reject };
+@@ -4680,6 +4708,14 @@ export class ClaudeAcpAgent {
+      *  `tool_use_id` so hosts can collapse them; a notice has no lifecycle to
+      *  update, so only the first becomes one. */
+     const noticedToolUses = new Set<string>();
++    const harnessActivity =
++      !clientSupportsAsyncTasks(this.clientCapabilities) && HarnessActivity.enabled()
++        ? (session.harnessActivity ??= new HarnessActivity(async (update) =>
++            this.client.sessionUpdate(
++              asSdkSessionNotification({ sessionId: params.sessionId, update }),
++            ),
++          ))
++        : undefined;
+     const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
+       clientSupportsAsyncTasks(this.clientCapabilities),
+       params.sessionId,
+@@ -6638,8 +6674,12 @@ export class ClaudeAcpAgent {
+                 break;
+               }
+               case "hook_started":
+-              case "hook_progress":
++                harnessActivity?.hookStarted(message.hook_id, message.hook_name, message.hook_event);
++                break;
+               case "hook_response":
++                await harnessActivity?.hookEnded(message.hook_id, message.outcome);
++                break;
++              case "hook_progress":
+               case "files_persisted":
+                 break;
+               case "task_progress":
+@@ -6698,6 +6738,11 @@ export class ClaudeAcpAgent {
+                   },
+                   sendUpdate,
+                 );
++                await harnessActivity?.taskStarted(
++                  message.task_id,
++                  message.description,
++                  message.is_backgrounded,
++                );
+                 await asyncTasks.taskStarted({
+                   task_id: message.task_id,
+                   task_type: message.task_type,
+@@ -6729,6 +6774,7 @@ export class ClaudeAcpAgent {
+                   message.tool_use_id,
+                   { reason: message.reason },
+                 );
++                await harnessActivity?.taskEnded(message.task_id, message.status);
+                 await asyncTasks.taskNotification({
+                   task_id: message.task_id,
+                   status: message.status,
+@@ -6756,6 +6802,19 @@ export class ClaudeAcpAgent {
+                   break;
+                 }
+                 await asyncTasks.taskUpdated(message.task_id, message.patch);
++                if (message.patch.is_backgrounded === true) {
++                  await harnessActivity?.taskBackgrounded(
++                    message.task_id,
++                    message.patch.description,
++                  );
++                }
++                if (
++                  message.patch.status === "completed" ||
++                  message.patch.status === "failed" ||
++                  message.patch.status === "killed"
++                ) {
++                  await harnessActivity?.taskEnded(message.task_id, message.patch.status);
++                }
+                 // A task moved to the background no longer blocks the tool
+                 // call that spawned it, nor its requests the foreground work.
+                 if (message.patch.is_backgrounded !== undefined) {
+@@ -9393,7 +9452,7 @@ export class ClaudeAcpAgent {
+   ): Promise<void> {
+     const replayStartedAt = performance.now();
+     const toolUseCache: ToolUseCache = {};
+-    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
++    const messages = resumedMessages ?? (await getFullSessionMessages(sessionId));
+     const historyLoadedAt = performance.now();
+     this.logger.log(
+       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
+@@ -11584,11 +11643,16 @@ export class ClaudeAcpAgent {
+ 
+   /** Whether the session forwards the text and the thinking of a subagent. */
+   private forwardsSubagentText(meta: NewSessionRequest["_meta"]): boolean {
+-    return (
+-      clientSupportsSubagents(this.clientCapabilities) ||
+-      supportsSubagentTranscript(this.clientCapabilities) ||
+-      (meta as NewSessionMeta | undefined)?.claudeCode?.options?.forwardSubagentText === true
+-    );
++    // 하네스 패치: 서브에이전트(Task) 작업을 메인 스레드에 항상 보이게 전달한다.
++    // (끄려면 env CLAUDE_ACP_HIDE_SUBAGENT_TEXT=1)
++    if (process.env.CLAUDE_ACP_HIDE_SUBAGENT_TEXT === "1") {
++      return (
++        clientSupportsSubagents(this.clientCapabilities) ||
++        supportsSubagentTranscript(this.clientCapabilities) ||
++        (meta as NewSessionMeta | undefined)?.claudeCode?.options?.forwardSubagentText === true
++      );
++    }
++    return true;
+   }
+ 
+   private async createSession(
+diff --git a/src/harness-activity.ts b/src/harness-activity.ts
+new file mode 100644
+index 0000000..a564440
+--- /dev/null
++++ b/src/harness-activity.ts
+@@ -0,0 +1,88 @@
++import type { AcpSessionNotification } from "./acp-subagents.js";
++
++type Publish = (update: AcpSessionNotification["update"]) => Promise<void>;
++
++const HOOK_SHOW_AFTER_MS = 1500;
++
++/** 하네스 패치: 백그라운드 작업·오래 걸리는 훅을 진행 중 tool call 카드로 보여 준다(Zed 등 AIR 미지원 클라이언트용). */
++export class HarnessActivity {
++  private readonly descriptions = new Map<string, string>();
++  private readonly shownTasks = new Set<string>();
++  private readonly hooks = new Map<string, { timer?: ReturnType<typeof setTimeout>; shown: boolean }>();
++
++  constructor(private readonly publish: Publish) {}
++
++  static enabled(): boolean {
++    return process.env.CLAUDE_ACP_HIDE_BACKGROUND !== "1";
++  }
++
++  async taskStarted(taskId: string, description: string, backgrounded: boolean | undefined) {
++    this.descriptions.set(taskId, description);
++    if (backgrounded) await this.showTask(taskId);
++  }
++
++  async taskBackgrounded(taskId: string, description?: string) {
++    if (description) this.descriptions.set(taskId, description);
++    await this.showTask(taskId);
++  }
++
++  async taskEnded(taskId: string, status: string) {
++    this.descriptions.delete(taskId);
++    if (!this.shownTasks.delete(taskId)) return;
++    await this.send({
++      sessionUpdate: "tool_call_update",
++      toolCallId: `bgtask-${taskId}`,
++      status: status === "completed" ? "completed" : "failed",
++    });
++  }
++
++  hookStarted(hookId: string, hookName: string, hookEvent: string) {
++    const entry: { timer?: ReturnType<typeof setTimeout>; shown: boolean } = { shown: false };
++    entry.timer = setTimeout(() => {
++      entry.shown = true;
++      const label =
++        hookName && hookName !== hookEvent ? `${hookEvent} (${hookName})` : hookEvent;
++      void this.send(this.card(`hook-${hookId}`, `훅 실행 중: ${label}`));
++    }, HOOK_SHOW_AFTER_MS);
++    this.hooks.set(hookId, entry);
++  }
++
++  async hookEnded(hookId: string, outcome: string) {
++    const entry = this.hooks.get(hookId);
++    if (!entry) return;
++    this.hooks.delete(hookId);
++    if (entry.timer) clearTimeout(entry.timer);
++    if (!entry.shown) return;
++    await this.send({
++      sessionUpdate: "tool_call_update",
++      toolCallId: `hook-${hookId}`,
++      status: outcome === "success" ? "completed" : "failed",
++    });
++  }
++
++  private async showTask(taskId: string) {
++    if (this.shownTasks.has(taskId)) return;
++    this.shownTasks.add(taskId);
++    const description = this.descriptions.get(taskId) || "작업";
++    await this.send(this.card(`bgtask-${taskId}`, `백그라운드: ${description}`));
++  }
++
++  private card(toolCallId: string, title: string): AcpSessionNotification["update"] {
++    return {
++      sessionUpdate: "tool_call",
++      toolCallId,
++      title,
++      kind: "other",
++      status: "in_progress",
++      rawInput: { description: title },
++    } as AcpSessionNotification["update"];
++  }
++
++  private async send(update: AcpSessionNotification["update"]) {
++    try {
++      await this.publish(update);
++    } catch {
++      return;
++    }
++  }
++}
+diff --git a/src/harness-bash.ts b/src/harness-bash.ts
+new file mode 100644
+index 0000000..ead18a3
+--- /dev/null
++++ b/src/harness-bash.ts
+@@ -0,0 +1,87 @@
++import { spawn } from "node:child_process";
++import { randomUUID } from "node:crypto";
++import type { AcpSessionNotification } from "./acp-subagents.js";
++
++type Publish = (update: AcpSessionNotification["update"]) => Promise<void>;
++
++const MAX_OUTPUT = 200_000;
++const MAX_CONTEXT = 20_000;
++const TIMEOUT_MS = 10 * 60 * 1000;
++
++/** 하네스 패치: `!명령`이면 그 명령 문자열, 아니면 undefined. */
++export function bangCommand(prompt: unknown): string | undefined {
++  if (!Array.isArray(prompt) || prompt.length !== 1) return undefined;
++  const block = prompt[0] as { type?: string; text?: string };
++  if (block?.type !== "text" || typeof block.text !== "string") return undefined;
++  const text = block.text.trim();
++  if (!text.startsWith("!")) return undefined;
++  const command = text.slice(1).trim();
++  return command.length > 0 ? command : undefined;
++}
++
++/** 하네스 패치: 모델을 거치지 않고 사용자가 친 셸 명령을 바로 실행하고, 다음 메시지에 붙일 기록을 돌려준다. */
++export async function runBangCommand(
++  command: string,
++  cwd: string,
++  publish: Publish,
++): Promise<string> {
++  const toolCallId = `bang-${randomUUID()}`;
++  await publish({
++    sessionUpdate: "tool_call",
++    toolCallId,
++    title: command,
++    kind: "execute",
++    status: "in_progress",
++    rawInput: { command, description: `직접 실행: ${command}` },
++  } as AcpSessionNotification["update"]);
++
++  const { stdout, stderr, code } = await new Promise<{
++    stdout: string;
++    stderr: string;
++    code: number | null;
++  }>((resolve) => {
++    let out = "";
++    let err = "";
++    const child = spawn("/bin/zsh", ["-lc", command], { cwd, env: process.env });
++    const timer = setTimeout(() => child.kill("SIGTERM"), TIMEOUT_MS);
++    child.stdout.on("data", (chunk) => {
++      if (out.length < MAX_OUTPUT) out += chunk.toString();
++    });
++    child.stderr.on("data", (chunk) => {
++      if (err.length < MAX_OUTPUT) err += chunk.toString();
++    });
++    child.on("error", (error) => {
++      clearTimeout(timer);
++      resolve({ stdout: out, stderr: err + String(error), code: 1 });
++    });
++    child.on("close", (exitCode) => {
++      clearTimeout(timer);
++      resolve({ stdout: out, stderr: err, code: exitCode });
++    });
++  });
++
++  const shown = [stdout, stderr].filter((part) => part.trim()).join("\n").trimEnd();
++  await publish({
++    sessionUpdate: "tool_call_update",
++    toolCallId,
++    status: code === 0 ? "completed" : "failed",
++    content: [
++      {
++        type: "content",
++        content: {
++          type: "text",
++          text: "```\n" + (shown || "(출력 없음)") + `\n\`\`\`\n종료 코드 ${code ?? "?"}`,
++        },
++      },
++    ],
++    rawOutput: { stdout, stderr, exitCode: code },
++  } as AcpSessionNotification["update"]);
++
++  const clip = (text: string) =>
++    text.length > MAX_CONTEXT ? text.slice(0, MAX_CONTEXT) + "\n…(잘림)" : text;
++  return (
++    `<bash-input>${command}</bash-input>\n` +
++    `<bash-stdout>${clip(stdout)}</bash-stdout>\n` +
++    `<bash-stderr>${clip(stderr)}</bash-stderr>\n`
++  );
++}
+diff --git a/src/resumed-session.ts b/src/resumed-session.ts
+index bc50df2..552db47 100644
+--- a/src/resumed-session.ts
++++ b/src/resumed-session.ts
+@@ -1,5 +1,7 @@
+ import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+ import { access, open, readdir } from "node:fs/promises";
++import { createReadStream } from "node:fs";
++import { createInterface } from "node:readline";
+ import path from "node:path";
+ import { claudeConfigDir } from "./paths.js";
+ import { SessionTiming } from "./session-timing.js";
+@@ -57,7 +59,7 @@ export async function readResumedSession(
+     // Deliberately search all project directories, matching replaySessionHistory.
+     // A client may reopen a session from a worktree or normalized path that is
+     // different from the directory under which Claude persisted the transcript.
+-    const messages = await getSessionMessages(sessionId);
++    const messages = await getFullSessionMessages(sessionId);
+     const model = resumedModelFromTranscript(messages);
+     timing.phase("read-transcript", ` messages=${messages.length} model=${model ?? "unknown"}`);
+     return { messages, model };
+@@ -110,6 +112,51 @@ export async function readResumedTail(
+   return withModel ? { model: (await readResumedSession(sessionId, logger)).model } : {};
+ }
+ 
++/** 하네스 패치: 압축(compact)으로 끊긴 사슬까지 포함해 jsonl 전체 대화를 파일 순서대로 읽는다.
++ *  CLAUDE_ACP_FULL_HISTORY=1 일 때만 쓰고, 실패하면 SDK 기본 경로로 돌아간다. */
++export async function getFullSessionMessages(sessionId: string): Promise<SessionMessage[]> {
++  if (process.env.CLAUDE_ACP_FULL_HISTORY !== "1") return getSessionMessages(sessionId);
++  try {
++    const file = await findTranscript(sessionId);
++    if (!file) return getSessionMessages(sessionId);
++    const out: SessionMessage[] = [];
++    // 하네스 패치: jsonl 을 통째 문자열로 읽으면 큰 세션(>~512MB)에서 V8 "Invalid
++    // string length" 로 터진다. 반드시 line 단위 스트리밍으로 읽는다.
++    const rl = createInterface({
++      input: createReadStream(file, { encoding: "utf8" }),
++      crlfDelay: Infinity,
++    });
++    try {
++      for await (const line of rl) {
++        if (!line) continue;
++        let d: Record<string, unknown>;
++        try {
++          d = JSON.parse(line);
++        } catch {
++          continue;
++        }
++        if ((d.type !== "user" && d.type !== "assistant") || d.isSidechain === true) continue;
++        out.push({
++          type: d.type,
++          uuid: String(d.uuid ?? ""),
++          session_id: String(d.sessionId ?? sessionId),
++          message: d.message,
++          parent_tool_use_id: null,
++          parent_agent_id: null,
++          is_meta: d.isMeta === true,
++          origin: d.origin ?? null,
++        } as SessionMessage);
++      }
++    } finally {
++      rl.close();
++    }
++    return out.length > 0 ? out : getSessionMessages(sessionId);
++  } catch {
++    // 어떤 이유로든 실패하면 SDK 기본 경로로 안전하게 폴백.
++    return getSessionMessages(sessionId);
++  }
++}
++
+ /** The local transcript of a session in any project directory, as the SDK looks it up. */
+ export async function findTranscript(sessionId: string): Promise<string | undefined> {
+   const projects = path.join(claudeConfigDir(), "projects");
+diff --git a/src/session-index/exclude-filter.ts b/src/session-index/exclude-filter.ts
+new file mode 100644
+index 0000000..77486f0
+--- /dev/null
++++ b/src/session-index/exclude-filter.ts
+@@ -0,0 +1,47 @@
++/**
++ * 하네스 패치: 세션 목록에서 자동화 세션(블로그 초안·논문 정제·Reflector·Curator·
++ * 로컬 커맨드 등)을 숨긴다. CLAUDE_ACP_HIDE_AUTOMATION=1 일 때만 적용한다.
++ * 패턴은 내장 기본값 + ~/.config/claude-acp/session-exclude.txt(한 줄 한 패턴, # 주석).
++ */
++
++import * as fs from "node:fs";
++import * as os from "node:os";
++import * as path from "node:path";
++
++const DEFAULT_PATTERNS = [
++  "너는 AI 개발자 본인이 쓰는 기술 블로그",
++  "다음은 Gemma 가 추출한 논문 정보",
++  "# Reflector task",
++  "# Curator task",
++  "<local-command-caveat>",
++  "/usage",
++];
++
++let cached: string[] | undefined;
++
++function patterns(): string[] {
++  if (cached) return cached;
++  const list = [...DEFAULT_PATTERNS];
++  try {
++    const file = path.join(os.homedir(), ".config", "claude-acp", "session-exclude.txt");
++    for (const raw of fs.readFileSync(file, "utf8").split("\n")) {
++      const line = raw.trim();
++      if (line && !line.startsWith("#")) list.push(line);
++    }
++  } catch {
++    // 파일이 없으면 기본값만 쓴다.
++  }
++  cached = list;
++  return cached;
++}
++
++export function isAutomationHidden(): boolean {
++  return process.env.CLAUDE_ACP_HIDE_AUTOMATION === "1";
++}
++
++/** 세션 제목(미rename 세션은 첫 프롬프트)이 숨길 자동화 패턴에 걸리는가. */
++export function isExcludedTitle(title: string | undefined): boolean {
++  if (!title) return false;
++  const t = title.trim();
++  return patterns().some((p) => t.includes(p));
++}
+diff --git a/src/session-index/service.ts b/src/session-index/service.ts
+index 75b4bd7..a5acf8a 100644
+--- a/src/session-index/service.ts
++++ b/src/session-index/service.ts
+@@ -20,6 +20,7 @@ import {
+ import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
+ import { airExtensionMeta } from "../air-extension.js";
+ import { sanitizeTitle } from "../session-titles.js";
++import { isAutomationHidden, isExcludedTitle } from "./exclude-filter.js";
+ import type { OwnSessionState } from "./activity.js";
+ import {
+   effectiveTitle,
+@@ -508,7 +509,8 @@ export class SessionIndexService {
+     own: (sessionId: string) => OwnSessionState | undefined,
+   ): Promise<ListSessionsResponse> {
+     const { limit, archived, includeWorktrees } = parseListOptions(params._meta);
+-    const cwd = params.cwd ?? null;
++    // 하네스 패치: CLAUDE_ACP_ALL_SESSIONS=1 이면 cwd 를 무시하고 모든 프로젝트 세션을 한 목록으로 보여준다.
++    const cwd = process.env.CLAUDE_ACP_ALL_SESSIONS === "1" ? null : (params.cwd ?? null);
+     const scope: ListScope = { cwd, archived, includeWorktrees };
+     const after =
+       params.cursor === null || params.cursor === undefined
+@@ -525,9 +527,12 @@ export class SessionIndexService {
+     });
+     const live = await livePromise;
+     const now = this.now();
++    const hideAutomation = isAutomationHidden();
+     const sessions = rows
+       // A fork whose fork response is not out yet is left out, as in the list subscriptions.
+       .filter((row) => !this.forkHolds.isHeld(row.sessionId))
++      // 하네스 패치: 자동화 세션(블로그·논문·Reflector·Curator·로컬커맨드) 숨김.
++      .filter((row) => !(hideAutomation && isExcludedTitle(row.title)))
+       .map((row) => sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now));
+     const last = rows[rows.length - 1];
+     return hasMore && last ? { sessions, nextCursor: encodeListCursor(last, scope) } : { sessions };
+diff --git a/src/session-mode.ts b/src/session-mode.ts
+index 477b9ed..a44b46f 100644
+--- a/src/session-mode.ts
++++ b/src/session-mode.ts
+@@ -90,7 +90,8 @@ export function resolveInitialPermissionMode(
+   if (sources.explicit !== undefined) {
+     return resolvePermissionMode(sources.explicit, logger, allowBypass);
+   }
+-  if (sources.resumed !== undefined) {
++  // 하네스 패치: 설정이 bypass 면 이어 가는 대화의 옛 모드보다 설정을 따른다.
++  if (sources.resumed !== undefined && sources.defaultMode !== "bypassPermissions") {
+     let rejected = false;
+     const mode = resolvePermissionMode(
+       sources.resumed,
