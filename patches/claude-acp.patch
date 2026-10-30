@@ -1,5 +1,5 @@
 diff --git a/src/acp-agent.ts b/src/acp-agent.ts
-index 90a8254..81e4198 100644
+index 90a8254..1b2b56f 100644
 --- a/src/acp-agent.ts
 +++ b/src/acp-agent.ts
 @@ -154,6 +154,7 @@ import type {
@@ -10,16 +10,17 @@ index 90a8254..81e4198 100644
  import type {
    ListSubscribeRequest,
    ListUnsubscribeRequest,
-@@ -164,6 +165,8 @@ import {
+@@ -164,6 +165,9 @@ import {
    backgroundedBashToolCallIds,
    clientSupportsAsyncTasks,
  } from "./async-tasks.js";
 +import { HarnessActivity } from "./harness-activity.js";
 +import { bangCommand, runBangCommand } from "./harness-bash.js";
++import { recordClaudeUsage } from "./harness-usage.js";
  import {
    AUTH_STATUS_PROBE_TIMEOUT_MS,
    AUTH_STATUS_UPDATE_METHOD,
-@@ -221,6 +224,7 @@ import {
+@@ -221,6 +225,7 @@ import {
    readResumedSession,
    readResumedTail,
    type ResumedSessionSnapshot,
@@ -27,7 +28,7 @@ index 90a8254..81e4198 100644
  } from "./resumed-session.js";
  import { SessionTiming } from "./session-timing.js";
  import { ALLOW_BYPASS } from "./permissions/modes.js";
-@@ -1483,6 +1487,8 @@ export type Session = {
+@@ -1483,6 +1488,8 @@ export type Session = {
    /** Session-owned async task controller. Prompt cancellation intentionally
     *  does not finish it because background work may outlive a prompt. */
    asyncTaskRuntime?: AsyncTaskRuntime;
@@ -36,7 +37,7 @@ index 90a8254..81e4198 100644
    /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
     *  hand it the retained summary. */
    contextCompaction?: ContextCompactionLifecycle;
-@@ -3244,13 +3250,17 @@ export class ClaudeAcpAgent {
+@@ -3244,13 +3251,17 @@ export class ClaudeAcpAgent {
        offset,
      });
      const page = this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
@@ -55,7 +56,7 @@ index 90a8254..81e4198 100644
          updatedAt: new Date(session.lastModified).toISOString(),
        });
      }
-@@ -3827,6 +3837,24 @@ export class ClaudeAcpAgent {
+@@ -3827,11 +3838,33 @@ export class ClaudeAcpAgent {
     * outcome of a turn is field for field a v1 prompt response.
     */
    async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -80,7 +81,16 @@ index 90a8254..81e4198 100644
      let events!: TurnEvents;
      const outcome = new Promise<TurnOutcome>((resolve, reject) => {
        events = { inserted() {}, ended: resolve, failed: reject };
-@@ -4680,6 +4708,14 @@ export class ClaudeAcpAgent {
+     });
+     await this.startTurn(params, events);
++    void outcome.then(
++      () => recordClaudeUsage(this.sessions[params.sessionId]?.query),
++      () => {},
++    );
+     return outcome;
+   }
+ 
+@@ -4680,6 +4713,14 @@ export class ClaudeAcpAgent {
       *  `tool_use_id` so hosts can collapse them; a notice has no lifecycle to
       *  update, so only the first becomes one. */
      const noticedToolUses = new Set<string>();
@@ -95,7 +105,7 @@ index 90a8254..81e4198 100644
      const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
        clientSupportsAsyncTasks(this.clientCapabilities),
        params.sessionId,
-@@ -6638,8 +6674,12 @@ export class ClaudeAcpAgent {
+@@ -6638,8 +6679,12 @@ export class ClaudeAcpAgent {
                  break;
                }
                case "hook_started":
@@ -109,7 +119,7 @@ index 90a8254..81e4198 100644
                case "files_persisted":
                  break;
                case "task_progress":
-@@ -6698,6 +6738,11 @@ export class ClaudeAcpAgent {
+@@ -6698,6 +6743,11 @@ export class ClaudeAcpAgent {
                    },
                    sendUpdate,
                  );
@@ -121,7 +131,7 @@ index 90a8254..81e4198 100644
                  await asyncTasks.taskStarted({
                    task_id: message.task_id,
                    task_type: message.task_type,
-@@ -6729,6 +6774,7 @@ export class ClaudeAcpAgent {
+@@ -6729,6 +6779,7 @@ export class ClaudeAcpAgent {
                    message.tool_use_id,
                    { reason: message.reason },
                  );
@@ -129,7 +139,7 @@ index 90a8254..81e4198 100644
                  await asyncTasks.taskNotification({
                    task_id: message.task_id,
                    status: message.status,
-@@ -6756,6 +6802,19 @@ export class ClaudeAcpAgent {
+@@ -6756,6 +6807,19 @@ export class ClaudeAcpAgent {
                    break;
                  }
                  await asyncTasks.taskUpdated(message.task_id, message.patch);
@@ -149,7 +159,7 @@ index 90a8254..81e4198 100644
                  // A task moved to the background no longer blocks the tool
                  // call that spawned it, nor its requests the foreground work.
                  if (message.patch.is_backgrounded !== undefined) {
-@@ -9393,7 +9452,7 @@ export class ClaudeAcpAgent {
+@@ -9393,7 +9457,7 @@ export class ClaudeAcpAgent {
    ): Promise<void> {
      const replayStartedAt = performance.now();
      const toolUseCache: ToolUseCache = {};
@@ -158,7 +168,7 @@ index 90a8254..81e4198 100644
      const historyLoadedAt = performance.now();
      this.logger.log(
        `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
-@@ -11584,11 +11643,16 @@ export class ClaudeAcpAgent {
+@@ -11584,11 +11648,16 @@ export class ClaudeAcpAgent {
  
    /** Whether the session forwards the text and the thinking of a subagent. */
    private forwardsSubagentText(meta: NewSessionRequest["_meta"]): boolean {
@@ -367,6 +377,72 @@ index 0000000..ead18a3
 +    `<bash-stderr>${clip(stderr)}</bash-stderr>\n`
 +  );
 +}
+diff --git a/src/harness-usage.ts b/src/harness-usage.ts
+new file mode 100644
+index 0000000..822af40
+--- /dev/null
++++ b/src/harness-usage.ts
+@@ -0,0 +1,60 @@
++import { mkdir, rename, writeFile } from "node:fs/promises";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import type { Query } from "@anthropic-ai/claude-agent-sdk";
++
++const MIN_INTERVAL_MS = 60_000;
++const TIMEOUT_MS = 10_000;
++let lastRecordedAt = 0;
++
++type Window = { utilization: number | null; resets_at: string | null } | null;
++
++export type ClaudeUsageSnapshot = {
++  five_hour: Window;
++  seven_day: Window;
++  updated: number;
++};
++
++export function usageFile(): string {
++  return process.env.CLAUDE_ACP_USAGE_FILE ?? join(homedir(), ".harness", "usage", "claude.json");
++}
++
++/** 하네스 패치: SDK 사용량 응답에서 5시간·7일 창만 뽑는다(없으면 null). */
++export function summarizeUsage(usage: unknown, now: number): ClaudeUsageSnapshot | null {
++  const limits = (usage as { rate_limits?: Record<string, unknown> } | null)?.rate_limits;
++  if (!limits || typeof limits !== "object") return null;
++  const pick = (value: unknown): Window => {
++    if (!value || typeof value !== "object") return null;
++    const window = value as { utilization?: unknown; resets_at?: unknown };
++    return {
++      utilization: typeof window.utilization === "number" ? window.utilization : null,
++      resets_at: typeof window.resets_at === "string" ? window.resets_at : null,
++    };
++  };
++  return { five_hour: pick(limits.five_hour), seven_day: pick(limits.seven_day), updated: now / 1000 };
++}
++
++/** 하네스 패치: 턴이 끝나면 Claude 구독 사용량을 파일로 남겨 Zed 타이틀바가 읽게 한다(1분에 한 번까지). */
++export async function recordClaudeUsage(query: Query | undefined): Promise<void> {
++  if (!query || process.env.CLAUDE_ACP_HIDE_USAGE === "1") return;
++  const now = Date.now();
++  if (now - lastRecordedAt < MIN_INTERVAL_MS) return;
++  lastRecordedAt = now;
++  try {
++    const usage = await Promise.race([
++      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
++      new Promise<never>((_, reject) =>
++        setTimeout(() => reject(new Error("usage timeout")), TIMEOUT_MS),
++      ),
++    ]);
++    const snapshot = summarizeUsage(usage, now);
++    if (!snapshot) return;
++    const file = usageFile();
++    await mkdir(dirname(file), { recursive: true });
++    const tmp = `${file}.${process.pid}.tmp`;
++    await writeFile(tmp, JSON.stringify(snapshot));
++    await rename(tmp, file);
++  } catch {
++    lastRecordedAt = 0;
++  }
++}
 diff --git a/src/resumed-session.ts b/src/resumed-session.ts
 index bc50df2..552db47 100644
 --- a/src/resumed-session.ts
@@ -542,3 +618,44 @@ index 477b9ed..a44b46f 100644
      let rejected = false;
      const mode = resolvePermissionMode(
        sources.resumed,
+diff --git a/src/tests/harness-usage.test.ts b/src/tests/harness-usage.test.ts
+new file mode 100644
+index 0000000..4600f87
+--- /dev/null
++++ b/src/tests/harness-usage.test.ts
+@@ -0,0 +1,35 @@
++import { describe, it, expect } from "vitest";
++import { summarizeUsage } from "../harness-usage.js";
++
++describe("summarizeUsage", () => {
++  it("keeps the five hour and seven day windows", () => {
++    const snapshot = summarizeUsage(
++      {
++        rate_limits: {
++          five_hour: { utilization: 38, resets_at: "2026-10-30T07:00:00Z" },
++          seven_day: { utilization: 12.5, resets_at: null },
++          seven_day_opus: { utilization: 1, resets_at: null },
++        },
++      },
++      1_793_300_000_000,
++    );
++    expect(snapshot).toEqual({
++      five_hour: { utilization: 38, resets_at: "2026-10-30T07:00:00Z" },
++      seven_day: { utilization: 12.5, resets_at: null },
++      updated: 1_793_300_000,
++    });
++  });
++
++  it("returns null without rate limits", () => {
++    expect(summarizeUsage({ rate_limits: null }, 0)).toBeNull();
++    expect(summarizeUsage(null, 0)).toBeNull();
++  });
++
++  it("treats missing windows as null", () => {
++    expect(summarizeUsage({ rate_limits: {} }, 0)).toEqual({
++      five_hour: null,
++      seven_day: null,
++      updated: 0,
++    });
++  });
++});

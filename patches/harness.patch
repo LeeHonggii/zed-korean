@@ -1,19 +1,21 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 7f2a220..3192089 100644
+index 7f2a220..707bb8f 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -113,6 +113,7 @@ members = [
+@@ -113,6 +113,8 @@ members = [
      "crates/http_client_tls",
      "crates/http_proxy",
      "crates/icons",
++    "crates/arena_view",
 +    "crates/canvas_editor",
      "crates/image_viewer",
      "crates/input_latency_ui",
      "crates/inspector_ui",
-@@ -386,6 +387,7 @@ http_client = { path = "crates/http_client" }
+@@ -386,6 +388,8 @@ http_client = { path = "crates/http_client" }
  http_client_tls = { path = "crates/http_client_tls" }
  http_proxy = { path = "crates/http_proxy" }
  icons = { path = "crates/icons" }
++arena_view = { path = "crates/arena_view" }
 +canvas_editor = { path = "crates/canvas_editor" }
  image_viewer = { path = "crates/image_viewer" }
  input_latency_ui = { path = "crates/input_latency_ui" }
@@ -393,10 +395,15 @@ index 546c52e..886c22c 100644
              })
              .tooltip(move |_, cx| {
 diff --git a/crates/agent_ui/src/agent_ui.rs b/crates/agent_ui/src/agent_ui.rs
-index ddf573c..824f691 100644
+index ddf573c..bd1b854 100644
 --- a/crates/agent_ui/src/agent_ui.rs
 +++ b/crates/agent_ui/src/agent_ui.rs
-@@ -570,7 +570,22 @@ impl Agent {
+@@ -1,3 +1,4 @@
++pub mod agent_board;
+ mod agent_configuration;
+ pub mod agent_connection_store;
+ mod agent_diff;
+@@ -570,7 +571,22 @@ impl Agent {
      pub fn icon(&self) -> Option<IconName> {
          match self {
              Self::NativeAgent => None,
@@ -420,6 +427,14 @@ index ddf573c..824f691 100644
              #[cfg(any(test, feature = "test-support"))]
              Self::Stub => None,
          }
+@@ -710,6 +726,7 @@ pub fn init(
+         init_language_model_settings(cx);
+     }
+     agent_panel::init(cx);
++    agent_board::init(cx);
+     context_server_configuration::init(language_registry, fs.clone(), cx);
+     thread_metadata_store::init(cx);
+     terminal_thread_metadata_store::init(cx);
 diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
 index 3ed8d1c..1d8241e 100644
 --- a/crates/agent_ui/src/conversation_view.rs
@@ -472,7 +487,7 @@ index 3ed8d1c..1d8241e 100644
                  }
              }
 diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
-index 90c9e0d..0af9c3c 100644
+index 90c9e0d..37ad729 100644
 --- a/crates/agent_ui/src/conversation_view/thread_view.rs
 +++ b/crates/agent_ui/src/conversation_view/thread_view.rs
 @@ -3065,12 +3065,30 @@ impl ThreadView {
@@ -666,6 +681,21 @@ index 90c9e0d..0af9c3c 100644
  
          let truncated_tooltip = truncated_output.then(|| {
              if let Some(output) = output {
+@@ -9232,11 +9348,13 @@ impl ThreadView {
+             || (should_show_raw_input && tool_call.raw_input.is_some());
+ 
+         let is_collapsible = has_content && !needs_confirmation;
++        // 하네스 패치: 터미널 없는 실행 카드(`!명령`)는 펼치기 버튼이 없으니 출력을 항상 보여 준다.
+         let is_open = self
+             .entry_view_state
+             .read(cx)
+             .is_tool_call_content_visible(tool_call)
+-            || generic_permissions.is_some();
++            || generic_permissions.is_some()
++            || (is_terminal_tool && has_content);
+ 
+         let input_output_header = |label: SharedString| {
+             Label::new(label)
 diff --git a/crates/agent_ui/src/thread_import.rs b/crates/agent_ui/src/thread_import.rs
 index 0fa50c0..dcddc42 100644
 --- a/crates/agent_ui/src/thread_import.rs
@@ -718,7 +748,7 @@ index 2c10bfd..06c0717 100644
  
          let created_at = existing_thread
              .and_then(|t| t.created_at)
-diff --git a/tmp/zed-trial/crates/canvas_editor/Cargo.toml b/crates/canvas_editor/Cargo.toml
+diff --git a/crates/canvas_editor/Cargo.toml b/crates/canvas_editor/Cargo.toml
 new file mode 100644
 index 0000000..9eed06a
 --- /dev/null
@@ -752,7 +782,7 @@ index 0000000..9eed06a
 +workspace.workspace = true
 +
 +[dev-dependencies]
-diff --git a/tmp/zed-trial/crates/canvas_editor/src/canvas_editor.rs b/crates/canvas_editor/src/canvas_editor.rs
+diff --git a/crates/canvas_editor/src/canvas_editor.rs b/crates/canvas_editor/src/canvas_editor.rs
 new file mode 100644
 index 0000000..8ce9b44
 --- /dev/null
@@ -1732,7 +1762,7 @@ index 0000000..8ce9b44
 +pub fn init(cx: &mut App) {
 +    workspace::register_project_item::<CanvasView>(cx);
 +}
-diff --git a/tmp/zed-trial/crates/canvas_editor/src/model.rs b/crates/canvas_editor/src/model.rs
+diff --git a/crates/canvas_editor/src/model.rs b/crates/canvas_editor/src/model.rs
 new file mode 100644
 index 0000000..0fdeceb
 --- /dev/null
@@ -2353,6 +2383,21 @@ index fbd5217..ba46aa3 100644
 +        runs: runs.into(),
 +    }
 +}
+diff --git a/crates/platform_title_bar/src/platform_title_bar.rs b/crates/platform_title_bar/src/platform_title_bar.rs
+index b69bb0d..d62a432 100644
+--- a/crates/platform_title_bar/src/platform_title_bar.rs
++++ b/crates/platform_title_bar/src/platform_title_bar.rs
+@@ -309,8 +309,10 @@ impl Render for PlatformTitleBar {
+             .bg(titlebar_color)
+             .content_stretch()
+             .child(
++                // 하네스 패치: 가운데 고정 요소(사용량)를 놓을 수 있게 기준 위치를 잡는다.
+                 div()
+                     .id(self.id.clone())
++                    .relative()
+                     .flex()
+                     .flex_row()
+                     .items_center()
 diff --git a/crates/project/src/project.rs b/crates/project/src/project.rs
 index 5235a3e..34e158a 100644
 --- a/crates/project/src/project.rs
@@ -2380,8 +2425,20 @@ index 5235a3e..34e158a 100644
          Some(project.update(cx, |project, cx| project.open_buffer(path.clone(), cx)))
      }
  
+diff --git a/crates/sidebar/Cargo.toml b/crates/sidebar/Cargo.toml
+index 6d4b5b8..b8e2770 100644
+--- a/crates/sidebar/Cargo.toml
++++ b/crates/sidebar/Cargo.toml
+@@ -17,6 +17,7 @@ default = []
+ 
+ [dependencies]
+ acp_thread.workspace = true
++arena_view.workspace = true
+ action_log.workspace = true
+ async-channel.workspace = true
+ agent.workspace = true
 diff --git a/crates/sidebar/src/sidebar.rs b/crates/sidebar/src/sidebar.rs
-index 68e3099..0e75141 100644
+index 68e3099..9a4b954 100644
 --- a/crates/sidebar/src/sidebar.rs
 +++ b/crates/sidebar/src/sidebar.rs
 @@ -68,7 +68,8 @@ use util::path_list::PathList;
@@ -2418,7 +2475,23 @@ index 68e3099..0e75141 100644
      }
  }
  
-@@ -1436,8 +1440,22 @@ impl Sidebar {
+@@ -861,6 +865,15 @@ impl Sidebar {
+         })
+         .detach();
+ 
++        // 하네스 패치: 아레나 상태가 바뀌면 대화 줄 아래 모델 줄 높이를 다시 잰다.
++        if let Some(store) = arena_view::ArenaStore::global(cx) {
++            cx.observe(&store, |this, _, cx| {
++                this.list_state.remeasure();
++                cx.notify();
++            })
++            .detach();
++        }
++
+         let filter_editor = cx.new(|cx| {
+             let mut editor = Editor::single_line(window, cx);
+             editor.set_placeholder_text("Search threads…", window, cx);
+@@ -1436,8 +1449,22 @@ impl Sidebar {
              let agent = Agent::from(agent_id.clone());
              let icon = match agent {
                  Agent::NativeAgent => IconName::ZedAgent,
@@ -2443,7 +2516,7 @@ index 68e3099..0e75141 100644
                  _ => IconName::ZedAgent,
              };
              let icon_from_external_svg = agent_server_store
-@@ -1446,7 +1464,48 @@ impl Sidebar {
+@@ -1446,7 +1473,48 @@ impl Sidebar {
              (icon, icon_from_external_svg)
          };
  
@@ -2493,7 +2566,7 @@ index 68e3099..0e75141 100644
          let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
          for workspace in &workspaces {
              if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-@@ -1641,6 +1700,7 @@ impl Sidebar {
+@@ -1641,6 +1709,7 @@ impl Sidebar {
                              highlight_positions: Vec::new(),
                              worktrees,
                              diff_stats: DiffStats::default(),
@@ -2501,7 +2574,19 @@ index 68e3099..0e75141 100644
                          })
                      };
  
-@@ -5860,7 +5920,9 @@ impl Sidebar {
+@@ -2273,7 +2342,10 @@ impl Sidebar {
+                     cx,
+                 )
+             }
+-            ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
++            ListEntry::Thread(thread) => {
++                let row = self.render_thread(ix, thread, is_active, is_selected, cx);
++                self.with_arena_rows(row, thread, cx)
++            }
+             ListEntry::Terminal(terminal) => {
+                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
+             }
+@@ -5860,7 +5932,9 @@ impl Sidebar {
      }
  
      fn thread_display_time(metadata: &ThreadMetadata) -> DateTime<Utc> {
@@ -2512,7 +2597,7 @@ index 68e3099..0e75141 100644
      }
  
      fn push_entries_by_display_time(
-@@ -5887,6 +5949,32 @@ impl Sidebar {
+@@ -5887,6 +5961,32 @@ impl Sidebar {
              .chain(threads.into_iter().map(ListEntry::Thread))
              .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
  
@@ -2545,7 +2630,118 @@ index 68e3099..0e75141 100644
          for entry in row_entries {
              if let ListEntry::Thread(thread) = &entry {
                  if let Some(session_id) = &thread.metadata.session_id {
-@@ -6322,6 +6410,8 @@ impl Sidebar {
+@@ -6281,6 +6381,110 @@ impl Sidebar {
+             .into_any_element()
+     }
+ 
++    // 하네스 패치: 그 대화에서 돌린 코드 아레나 모델들을 대화 줄 아래에 점·역할·토큰·경과로 보여 준다.
++    fn with_arena_rows(
++        &self,
++        row: AnyElement,
++        thread: &ThreadEntry,
++        cx: &mut Context<Self>,
++    ) -> AnyElement {
++        let status = cx.theme().status();
++        let (dot_color, dot_glyph) = match thread.status {
++            AgentThreadStatus::Running => (status.warning, "●"),
++            AgentThreadStatus::WaitingForConfirmation | AgentThreadStatus::Error => {
++                (status.error, "●")
++            }
++            _ if self.contents.is_thread_notified(&thread.metadata.thread_id) => {
++                (status.info, "●")
++            }
++            _ => (cx.theme().colors().text_muted, "○"),
++        };
++        let row = h_flex()
++            .w_full()
++            .child(
++                div()
++                    .w(px(14.))
++                    .flex_none()
++                    .flex()
++                    .justify_center()
++                    .text_xs()
++                    .text_color(dot_color)
++                    .child(dot_glyph),
++            )
++            .child(div().flex_1().min_w_0().child(row))
++            .into_any_element();
++        let Some(session) = thread.metadata.session_id.as_ref() else {
++            return row;
++        };
++        let Some(store) = arena_view::ArenaStore::global(cx) else {
++            return row;
++        };
++        let rows: Vec<(String, Vec<(arena_view::ArenaEntry, arena_view::ArenaState, bool)>)> = {
++            let store = store.read(cx);
++            store
++                .runs_for_session(session.0.as_ref())
++                .take(2)
++                .map(|run| {
++                    let entries = run
++                        .entries
++                        .iter()
++                        .map(|entry| (entry.clone(), store.state_of(entry), store.is_seen(entry)))
++                        .collect();
++                    (run.id.clone(), entries)
++                })
++                .collect()
++        };
++        if rows.is_empty() {
++            return row;
++        }
++        let mut column = v_flex().w_full().child(row);
++        for (run_index, (run_id, entries)) in rows.into_iter().enumerate() {
++            for (entry_index, (entry, state, seen)) in entries.into_iter().enumerate() {
++                let (color, glyph) = arena_view::dot(state, seen, cx);
++                let summary = arena_view::entry_summary(&entry, state);
++                let workspace = self
++                    .multi_workspace
++                    .upgrade()
++                    .map(|mw| mw.read(cx).workspace().clone());
++                let run_id = run_id.clone();
++                column = column.child(
++                    h_flex()
++                        .id(SharedString::from(format!(
++                            "arena-{}-{run_index}-{entry_index}",
++                            session.0
++                        )))
++                        .w_full()
++                        .pl_8()
++                        .pr_2()
++                        .gap_1p5()
++                        .cursor_pointer()
++                        .hover(|el| el.bg(cx.theme().colors().element_hover))
++                        .child(div().text_xs().text_color(color).child(glyph))
++                        .child(
++                            Label::new(entry.label.clone())
++                                .size(LabelSize::XSmall)
++                                .truncate(),
++                        )
++                        .child(
++                            Label::new(summary)
++                                .size(LabelSize::XSmall)
++                                .color(Color::Muted)
++                                .truncate(),
++                        )
++                        .on_click(move |_, window, cx| {
++                            if let Some(workspace) = workspace.clone() {
++                                let run_id = run_id.clone();
++                                workspace.update(cx, |workspace, cx| {
++                                    arena_view::open_arena(workspace, Some(run_id), window, cx);
++                                });
++                            }
++                        }),
++                );
++            }
++        }
++        column.into_any_element()
++    }
++
+     fn render_thread(
+         &self,
+         ix: usize,
+@@ -6322,6 +6526,8 @@ impl Sidebar {
  
          let timestamp: SharedString = if is_empty_draft {
              SharedString::default()
@@ -2554,7 +2750,7 @@ index 68e3099..0e75141 100644
          } else {
              format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
          };
-@@ -6350,6 +6440,10 @@ impl Sidebar {
+@@ -6350,6 +6556,10 @@ impl Sidebar {
              .when(is_draft, |this| {
                  this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
              })
@@ -2565,7 +2761,27 @@ index 68e3099..0e75141 100644
              .status(thread.status)
              .is_remote(is_remote)
              .when_some(icon_svg, |this, svg| {
-@@ -8179,6 +8273,32 @@ fn all_thread_infos_for_workspace(
+@@ -7590,6 +7800,19 @@ impl Sidebar {
+                         this.toggle_archive(&ToggleThreadHistory, window, cx);
+                     })),
+             )
++            // 하네스 패치: 살아 있는 대화들을 가운데에 나란히 보는 에이전트 보드.
++            .child(
++                IconButton::new("agent-board", IconName::ZedAgent)
++                    .icon_size(IconSize::Small)
++                    .tooltip(Tooltip::text("에이전트 보드"))
++                    .on_click(cx.listener(|this, _, window, cx| {
++                        if let Some(workspace) = this.active_workspace(cx) {
++                            workspace.update(cx, |workspace, cx| {
++                                agent_ui::agent_board::open_agent_board(workspace, window, cx);
++                            });
++                        }
++                    })),
++            )
+             .child(div().flex_1())
+             .child(self.render_recent_projects_button(cx))
+     }
+@@ -8179,6 +8402,32 @@ fn all_thread_infos_for_workspace(
  
              let diff_stats = thread.action_log().read(cx).diff_stats(cx);
  
@@ -2598,7 +2814,7 @@ index 68e3099..0e75141 100644
              Some(ActiveThreadInfo {
                  session_id,
                  title,
-@@ -8188,6 +8308,7 @@ fn all_thread_infos_for_workspace(
+@@ -8188,6 +8437,7 @@ fn all_thread_infos_for_workspace(
                  is_background,
                  is_title_generating,
                  diff_stats,
@@ -2659,22 +2875,64 @@ index 97bdd60..aedd0c4 100644
              // Collapsed project header
              ListEntry::ProjectHeader {
 diff --git a/crates/title_bar/Cargo.toml b/crates/title_bar/Cargo.toml
-index 57aceb8..c9cffc4 100644
+index 57aceb8..c137938 100644
 --- a/crates/title_bar/Cargo.toml
 +++ b/crates/title_bar/Cargo.toml
-@@ -37,6 +37,7 @@ platform_title_bar.workspace = true
+@@ -37,6 +37,8 @@ platform_title_bar.workspace = true
  call.workspace = true
  channel.workspace = true
  chrono.workspace = true
 +log.workspace = true
++serde_json.workspace = true
  client.workspace = true
  cloud_api_types.workspace = true
  command_palette_hooks.workspace = true
+@@ -65,6 +67,7 @@ zed_actions.workspace = true
+ arrayvec = "0.7.6"
+ 
+ [dev-dependencies]
++tempfile.workspace = true
+ call = { workspace = true, features = ["test-support"] }
+ client = { workspace = true, features = ["test-support"] }
+ gpui = { workspace = true, features = ["test-support"] }
 diff --git a/crates/title_bar/src/title_bar.rs b/crates/title_bar/src/title_bar.rs
-index fe8c9e3..f9723b1 100644
+index fe8c9e3..0695e30 100644
 --- a/crates/title_bar/src/title_bar.rs
 +++ b/crates/title_bar/src/title_bar.rs
-@@ -404,6 +404,7 @@ impl Render for TitleBar {
+@@ -1,5 +1,6 @@
+ mod application_menu;
+ pub mod collab;
++mod harness_usage;
+ mod onboarding_banner;
+ mod plan_chip;
+ mod title_bar_settings;
+@@ -220,6 +221,8 @@ pub struct TitleBar {
+     update_version: Entity<UpdateVersion>,
+     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
+     _diagnostics_subscription: Option<gpui::Subscription>,
++    usage: Vec<harness_usage::UsageChip>,
++    _usage_poll: gpui::Task<()>,
+ }
+ 
+ impl Render for TitleBar {
+@@ -243,7 +246,7 @@ impl Render for TitleBar {
+ 
+         let show_menus = show_menus(cx);
+ 
+-        let mut children = <ArrayVec<_, 5>>::new();
++        let mut children = <ArrayVec<_, 6>>::new();
+ 
+         let mut project_name = None;
+         let mut repository = None;
+@@ -353,6 +356,7 @@ impl Render for TitleBar {
+         );
+ 
+         children.push(self.render_collaborator_list(window, cx).into_any_element());
++        children.push(self.render_usage(cx).into_any_element());
+ 
+         if title_bar_settings.show_onboarding_banner {
+             if let Some(banner) = &self.banner {
+@@ -404,6 +408,7 @@ impl Render for TitleBar {
                              ),
                      )
                  })
@@ -2682,10 +2940,62 @@ index fe8c9e3..f9723b1 100644
                  .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
                      this.child(self.render_user_menu_button(cx))
                  })
-@@ -1216,6 +1217,30 @@ impl TitleBar {
+@@ -535,9 +540,30 @@ impl TitleBar {
+             update_version,
+             screen_share_popover_handle: PopoverMenuHandle::default(),
+             _diagnostics_subscription: None,
++            usage: Vec::new(),
++            _usage_poll: gpui::Task::ready(()),
+         };
+ 
+         this.observe_diagnostics(cx);
++        this._usage_poll = cx.spawn(async move |this, cx| {
++            loop {
++                let chips = cx
++                    .background_spawn(async { harness_usage::snapshot(std::time::SystemTime::now()) })
++                    .await;
++                if this
++                    .update(cx, |this, cx| {
++                        if this.usage != chips {
++                            this.usage = chips;
++                            cx.notify();
++                        }
++                    })
++                    .is_err()
++                {
++                    break;
++                }
++                cx.background_executor().timer(USAGE_POLL).await;
++            }
++        });
+ 
+         this
+     }
+@@ -1216,6 +1242,51 @@ impl TitleBar {
              })
      }
  
++    // 하네스 패치: 가운데에 Claude → GPT → Jev 남은 사용량(초기화까지 남은 시간).
++    fn render_usage(&self, _cx: &mut Context<Self>) -> impl IntoElement {
++        h_flex()
++            .absolute()
++            .top_0()
++            .bottom_0()
++            .left_0()
++            .right_0()
++            .justify_center()
++            .items_center()
++            .gap_3()
++            .children(self.usage.iter().map(|chip| {
++                let color = match chip.remaining_percent {
++                    Some(left) if left < 20. => Color::Error,
++                    Some(left) if left < 50. => Color::Warning,
++                    _ => Color::Muted,
++                };
++                Label::new(chip.label()).size(LabelSize::Small).color(color)
++            }))
++    }
++
 +    // 하네스 패치: 프로필 옆 그림판 버튼 — 오늘 날짜 캔버스를 가운데 편집 영역에 연다(없으면 만든다).
 +    fn render_canvas_button(&self, _cx: &mut Context<Self>) -> impl IntoElement {
 +        let workspace = self.workspace.clone();
@@ -2713,7 +3023,7 @@ index fe8c9e3..f9723b1 100644
      pub fn render_user_menu_button(&mut self, cx: &mut Context<Self>) -> impl Element {
          let show_update_button = self.update_version.read(cx).show_update_in_menu_bar();
  
-@@ -1489,3 +1514,26 @@ mod tests {
+@@ -1489,3 +1560,28 @@ mod tests {
          );
      }
  }
@@ -2740,6 +3050,8 @@ index fe8c9e3..f9723b1 100644
 +    }
 +    std::fs::write(path, CANVAS_TEMPLATE)
 +}
++
++const USAGE_POLL: Duration = Duration::from_secs(30);
 diff --git a/crates/workspace/src/invalid_item_view.rs b/crates/workspace/src/invalid_item_view.rs
 index 38e100a..91c6a69 100644
 --- a/crates/workspace/src/invalid_item_view.rs
@@ -3101,27 +3413,1280 @@ index 38c1dc7..8acfb00 100644
                                  window.handler_for(&pane, move |pane, window, cx| {
                                      pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
 diff --git a/crates/zed/Cargo.toml b/crates/zed/Cargo.toml
-index 496e016..12339f9 100644
+index 496e016..c021f36 100644
 --- a/crates/zed/Cargo.toml
 +++ b/crates/zed/Cargo.toml
-@@ -141,6 +141,7 @@ tempfile = { workspace = true, optional = true }
+@@ -141,6 +141,8 @@ tempfile = { workspace = true, optional = true }
  edit_prediction.workspace = true
  edit_prediction_ui.workspace = true
  http_client.workspace = true
++arena_view.workspace = true
 +canvas_editor.workspace = true
  image_viewer.workspace = true
  input_latency_ui.workspace = true
  inspector_ui.workspace = true
 diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
-index 4089c5d..4ceacec 100644
+index 4089c5d..1a7fac0 100644
 --- a/crates/zed/src/main.rs
 +++ b/crates/zed/src/main.rs
-@@ -730,6 +730,8 @@ fn main() {
+@@ -730,6 +730,10 @@ fn main() {
  
          editor::init(cx);
          image_viewer::init(cx);
 +        // 하네스 패치: .canvas 를 박스 그리기 화면으로 연다.
 +        canvas_editor::init(cx);
++        // 하네스 패치: 코드 아레나 실시간 화면.
++        arena_view::init(cx);
          repl::notebook::init(cx);
          diagnostics::init(cx);
  
+diff --git a/crates/agent_ui/src/agent_board.rs b/crates/agent_ui/src/agent_board.rs
+new file mode 100644
+index 0000000..bfc8479
+--- /dev/null
++++ b/crates/agent_ui/src/agent_board.rs
+@@ -0,0 +1,276 @@
++// 하네스 패치: 에이전트 보드 — 살아 있는 대화(Claude·Codex·Zed Agent+Ollama)를 가운데에 칸으로 나란히 띄운다.
++use std::collections::{HashMap, HashSet};
++use std::time::{Duration, Instant};
++
++use acp_thread::ThreadStatus;
++use gpui::{
++    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, Render, Task, WeakEntity,
++    Window, actions, px,
++};
++use ui::prelude::*;
++use workspace::{Workspace, item::Item};
++
++use crate::{AgentPanel, ConversationView, ThreadId};
++
++actions!(
++    agent_board,
++    [
++        /// 살아 있는 에이전트 대화들을 가운데에 나란히 띄운다.
++        OpenAgentBoard
++    ]
++);
++
++const POLL: Duration = Duration::from_millis(1000);
++const MAX_COLUMNS: usize = 4;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum BoardState {
++    Idle,
++    Running,
++    Waiting,
++    Unseen,
++    Error,
++}
++
++impl BoardState {
++    pub fn dot(self, cx: &App) -> (Hsla, &'static str) {
++        let status = cx.theme().status();
++        match self {
++            BoardState::Idle => (cx.theme().colors().text_muted, "○"),
++            BoardState::Running => (status.warning, "●"),
++            BoardState::Waiting | BoardState::Error => (status.error, "●"),
++            BoardState::Unseen => (status.info, "●"),
++        }
++    }
++
++    fn label(self) -> &'static str {
++        match self {
++            BoardState::Idle => "쉬는 중",
++            BoardState::Running => "작업 중",
++            BoardState::Waiting => "허락 대기",
++            BoardState::Unseen => "끝남 · 안 봄",
++            BoardState::Error => "오류",
++        }
++    }
++
++    fn order(self) -> u8 {
++        match self {
++            BoardState::Waiting => 0,
++            BoardState::Running => 1,
++            BoardState::Unseen => 2,
++            BoardState::Error => 3,
++            BoardState::Idle => 4,
++        }
++    }
++}
++
++struct Column {
++    id: ThreadId,
++    view: Entity<ConversationView>,
++    agent: SharedString,
++    title: SharedString,
++    state: BoardState,
++    running_since: Option<Instant>,
++}
++
++pub struct AgentBoard {
++    workspace: WeakEntity<Workspace>,
++    focus_handle: FocusHandle,
++    columns: Vec<Column>,
++    last_running: HashMap<ThreadId, Instant>,
++    unseen: HashSet<ThreadId>,
++    _poll: Task<()>,
++}
++
++fn agent_label(view: &Entity<ConversationView>, cx: &App) -> Option<(SharedString, SharedString, bool, ThreadStatus, bool)> {
++    let conversation = view.read(cx);
++    let pending = conversation.root_thread_has_pending_tool_call(cx);
++    let thread_view = conversation.root_thread_view()?;
++    let thread_view = thread_view.read(cx);
++    let thread = thread_view.thread.read(cx);
++    if thread.entries().is_empty() {
++        return None;
++    }
++    let model = thread_view
++        .as_native_thread(cx)
++        .and_then(|native| native.read(cx).model().map(|model| model.name.0.clone()));
++    let agent: SharedString = match model {
++        Some(model) => format!("{} · {}", thread_view.agent_display_name, model).into(),
++        None => thread_view.agent_display_name.clone(),
++    };
++    let title = thread.title().unwrap_or_else(|| "새 대화".into());
++    Some((agent, title, pending, thread.status(), thread.had_error()))
++}
++
++impl AgentBoard {
++    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
++        let poll = cx.spawn(async move |this, cx| {
++            loop {
++                if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
++                    break;
++                }
++                cx.background_executor().timer(POLL).await;
++            }
++        });
++        Self {
++            workspace,
++            focus_handle: cx.focus_handle(),
++            columns: Vec::new(),
++            last_running: HashMap::new(),
++            unseen: HashSet::new(),
++            _poll: poll,
++        }
++    }
++
++    fn refresh(&mut self, cx: &mut Context<Self>) {
++        let Some(workspace) = self.workspace.upgrade() else {
++            return;
++        };
++        let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
++            return;
++        };
++        let views = panel.read(cx).conversation_views();
++        let mut columns = Vec::new();
++        for view in views {
++            let id = view.read(cx).parent_id();
++            let Some((agent, title, pending, status, error)) = agent_label(&view, cx) else {
++                continue;
++            };
++            let running = status == ThreadStatus::Generating;
++            if running {
++                self.last_running.entry(id).or_insert_with(Instant::now);
++            } else if self.last_running.remove(&id).is_some() {
++                self.unseen.insert(id);
++            }
++            let state = if pending {
++                BoardState::Waiting
++            } else if error {
++                BoardState::Error
++            } else if running {
++                BoardState::Running
++            } else if self.unseen.contains(&id) {
++                BoardState::Unseen
++            } else {
++                BoardState::Idle
++            };
++            columns.push(Column {
++                id,
++                view,
++                agent,
++                title,
++                state,
++                running_since: self.last_running.get(&id).copied(),
++            });
++        }
++        columns.sort_by_key(|column| column.state.order());
++        columns.truncate(MAX_COLUMNS);
++        self.columns = columns;
++        cx.notify();
++    }
++
++    fn render_column(&self, column: &Column, cx: &mut Context<Self>) -> AnyElement {
++        let colors = cx.theme().colors().clone();
++        let (color, glyph) = column.state.dot(cx);
++        let mut status = column.state.label().to_string();
++        if let Some(since) = column.running_since {
++            status.push_str(&format!(" · {}s", since.elapsed().as_secs()));
++        }
++        let id = column.id;
++        v_flex()
++            .flex_1()
++            .min_w(px(320.))
++            .h_full()
++            .border_r_1()
++            .border_color(colors.border)
++            .child(
++                h_flex()
++                    .id(SharedString::from(format!("board-head-{id:?}")))
++                    .gap_1p5()
++                    .px_2()
++                    .py_1()
++                    .border_b_1()
++                    .border_color(colors.border)
++                    .bg(colors.toolbar_background)
++                    .cursor_pointer()
++                    .child(div().text_color(color).child(glyph))
++                    .child(Label::new(column.agent.clone()).size(LabelSize::Small))
++                    .child(
++                        Label::new(column.title.clone())
++                            .size(LabelSize::Small)
++                            .color(Color::Muted)
++                            .truncate(),
++                    )
++                    .child(div().flex_1())
++                    .child(Label::new(status).size(LabelSize::XSmall).color(Color::Muted))
++                    .on_click(cx.listener(move |this, _, _, cx| {
++                        this.unseen.remove(&id);
++                        this.refresh(cx);
++                    })),
++            )
++            .child(div().flex_1().min_h_0().child(column.view.clone()))
++            .into_any_element()
++    }
++}
++
++impl EventEmitter<()> for AgentBoard {}
++
++impl Focusable for AgentBoard {
++    fn focus_handle(&self, _: &App) -> FocusHandle {
++        self.focus_handle.clone()
++    }
++}
++
++impl Item for AgentBoard {
++    type Event = ();
++
++    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
++        "에이전트 보드".into()
++    }
++
++    fn tab_icon(&self, _: &Window, _: &App) -> Option<Icon> {
++        Some(Icon::new(IconName::ZedAgent))
++    }
++}
++
++impl Render for AgentBoard {
++    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let colors = cx.theme().colors().clone();
++        let mut columns = Vec::new();
++        for column in &self.columns {
++            columns.push(self.render_column(column, cx));
++        }
++        v_flex()
++            .size_full()
++            .track_focus(&self.focus_handle)
++            .bg(colors.editor_background)
++            .when(columns.is_empty(), |el| {
++                el.child(
++                    div().p_4().child(
++                        Label::new("열려 있는 대화가 없습니다 — 에이전트 패널에서 대화를 시작하면 여기에 칸이 생깁니다")
++                            .color(Color::Muted),
++                    ),
++                )
++            })
++            .child(h_flex().size_full().items_start().children(columns))
++    }
++}
++
++pub fn open_agent_board(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
++    let existing = workspace.items_of_type::<AgentBoard>(cx).next();
++    if let Some(existing) = existing {
++        workspace.activate_item(&existing, true, true, window, cx);
++        return;
++    }
++    let handle = cx.entity().downgrade();
++    let board = cx.new(|cx| AgentBoard::new(handle, cx));
++    workspace.add_item_to_active_pane(Box::new(board), None, true, window, cx);
++}
++
++pub fn init(cx: &mut App) {
++    cx.observe_new(|workspace: &mut Workspace, _, _| {
++        workspace.register_action(|workspace, _: &OpenAgentBoard, window, cx| {
++            open_agent_board(workspace, window, cx);
++        });
++    })
++    .detach();
++}
+diff --git a/crates/arena_view/Cargo.toml b/crates/arena_view/Cargo.toml
+new file mode 100644
+index 0000000..7d62853
+--- /dev/null
++++ b/crates/arena_view/Cargo.toml
+@@ -0,0 +1,25 @@
++[package]
++name = "arena_view"
++version = "0.1.0"
++edition.workspace = true
++publish.workspace = true
++license = "GPL-3.0-or-later"
++
++[lints]
++workspace = true
++
++[lib]
++path = "src/arena_view.rs"
++doctest = false
++
++[dependencies]
++gpui.workspace = true
++libc.workspace = true
++serde_json.workspace = true
++settings.workspace = true
++theme_settings.workspace = true
++ui.workspace = true
++workspace.workspace = true
++
++[dev-dependencies]
++tempfile.workspace = true
+diff --git a/crates/arena_view/src/arena_view.rs b/crates/arena_view/src/arena_view.rs
+new file mode 100644
+index 0000000..c49a693
+--- /dev/null
++++ b/crates/arena_view/src/arena_view.rs
+@@ -0,0 +1,397 @@
++// 하네스 패치: 코드 아레나 실시간 화면 — ~/.harness/arena/<run>/<label>.json·.live.txt 를 읽어 모델 칸을 나란히 보여 준다.
++mod model;
++
++use std::collections::{HashMap, HashSet};
++use std::path::PathBuf;
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use gpui::{
++    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, Hsla,
++    Render, ScrollHandle, Task, Window, actions, div, px,
++};
++use settings::Settings as _;
++use theme_settings::ThemeSettings;
++use ui::prelude::*;
++use workspace::{Workspace, item::Item};
++
++pub use crate::model::{ArenaEntry, ArenaRun, ArenaState, format_elapsed};
++
++actions!(
++    arena_view,
++    [
++        /// 코드 아레나 화면을 연다.
++        OpenArena
++    ]
++);
++
++const POLL: Duration = Duration::from_millis(1000);
++const MAX_AGE_SECS: f64 = 24. * 3600.;
++const LIVE_TAIL_BYTES: u64 = 24_000;
++const RUN_TABS: usize = 8;
++
++fn now_secs() -> f64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_secs_f64())
++        .unwrap_or_default()
++}
++
++fn arena_root() -> Option<PathBuf> {
++    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".harness/arena"))
++}
++
++fn pid_alive(pid: u32) -> bool {
++    unsafe { libc::kill(pid as i32, 0) == 0 }
++}
++
++pub struct ArenaStore {
++    pub runs: Vec<ArenaRun>,
++    seen: HashSet<(String, String)>,
++    _poll: Task<()>,
++}
++
++struct GlobalArenaStore(Entity<ArenaStore>);
++
++impl Global for GlobalArenaStore {}
++
++impl ArenaStore {
++    pub fn global(cx: &App) -> Option<Entity<ArenaStore>> {
++        cx.try_global::<GlobalArenaStore>().map(|g| g.0.clone())
++    }
++
++    pub fn runs_for_session<'a>(&'a self, session: &'a str) -> impl Iterator<Item = &'a ArenaRun> {
++        self.runs.iter().filter(move |run| run.session() == Some(session))
++    }
++
++    pub fn state_of(&self, entry: &ArenaEntry) -> ArenaState {
++        entry.effective_state(now_secs(), pid_alive)
++    }
++
++    pub fn is_seen(&self, entry: &ArenaEntry) -> bool {
++        self.seen
++            .contains(&(entry.run.clone(), entry.label.clone()))
++    }
++
++    fn mark_run_seen(&mut self, run: &ArenaRun) -> bool {
++        let mut changed = false;
++        for entry in &run.entries {
++            if entry.state == "done" {
++                changed |= self.seen.insert((entry.run.clone(), entry.label.clone()));
++            }
++        }
++        changed
++    }
++}
++
++pub fn dot(state: ArenaState, seen: bool, cx: &App) -> (Hsla, &'static str) {
++    let status = cx.theme().status();
++    match state {
++        ArenaState::Waiting => (cx.theme().colors().text_muted, "○"),
++        ArenaState::Running => (status.warning, "●"),
++        ArenaState::Done if seen => (cx.theme().colors().text_muted, "✓"),
++        ArenaState::Done => (status.info, "●"),
++        ArenaState::Failed | ArenaState::Stalled => (status.error, "●"),
++    }
++}
++
++pub fn entry_summary(entry: &ArenaEntry, state: ArenaState) -> String {
++    let mut parts = vec![entry.role_label().to_string()];
++    if state == ArenaState::Stalled {
++        parts.push("멈춤".into());
++    }
++    if entry.tokens > 0 {
++        parts.push(format!("{}tok", entry.tokens));
++    }
++    if let Some(elapsed) = entry.elapsed(now_secs()) {
++        parts.push(format_elapsed(elapsed));
++    }
++    parts.join(" · ")
++}
++
++pub fn open_arena(
++    workspace: &mut Workspace,
++    run: Option<String>,
++    window: &mut Window,
++    cx: &mut Context<Workspace>,
++) {
++    let existing = workspace.items_of_type::<ArenaView>(cx).next();
++    if let Some(existing) = existing {
++        existing.update(cx, |view, cx| {
++            if run.is_some() {
++                view.selected_run = run.clone();
++            }
++            cx.notify();
++        });
++        workspace.activate_item(&existing, true, true, window, cx);
++        return;
++    }
++    let view = cx.new(|cx| ArenaView::new(run, cx));
++    workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
++}
++
++pub struct ArenaView {
++    store: Option<Entity<ArenaStore>>,
++    selected_run: Option<String>,
++    scrolls: HashMap<String, ScrollHandle>,
++    focus_handle: FocusHandle,
++    _observe: Option<gpui::Subscription>,
++}
++
++impl ArenaView {
++    fn new(selected_run: Option<String>, cx: &mut Context<Self>) -> Self {
++        let store = ArenaStore::global(cx);
++        let observe = store.as_ref().map(|store| {
++            cx.observe(store, |this, _, cx| {
++                for handle in this.scrolls.values() {
++                    handle.scroll_to_bottom();
++                }
++                cx.notify();
++            })
++        });
++        Self {
++            store,
++            selected_run,
++            scrolls: HashMap::new(),
++            focus_handle: cx.focus_handle(),
++            _observe: observe,
++        }
++    }
++
++    fn current_run(&self, cx: &App) -> Option<ArenaRun> {
++        let store = self.store.as_ref()?.read(cx);
++        self.selected_run
++            .as_ref()
++            .and_then(|id| store.runs.iter().find(|run| &run.id == id))
++            .or_else(|| store.runs.first())
++            .cloned()
++    }
++
++    fn render_run_tabs(&self, current: Option<&str>, cx: &mut Context<Self>) -> impl IntoElement {
++        let colors = cx.theme().colors().clone();
++        let runs: Vec<ArenaRun> = self
++            .store
++            .as_ref()
++            .map(|store| store.read(cx).runs.iter().take(RUN_TABS).cloned().collect())
++            .unwrap_or_default();
++        let store = self.store.clone();
++        h_flex()
++            .w_full()
++            .flex_wrap()
++            .gap_2()
++            .px_2()
++            .py_1()
++            .border_b_1()
++            .border_color(colors.border)
++            .bg(colors.toolbar_background)
++            .children(runs.into_iter().enumerate().map(|(index, run)| {
++                let selected = current == Some(run.id.as_str());
++                let mut row = h_flex()
++                    .id(("arena-run", index))
++                    .gap_1()
++                    .px_1p5()
++                    .py_0p5()
++                    .rounded_sm()
++                    .cursor_pointer()
++                    .when(selected, |el| el.bg(colors.element_selected))
++                    .child(
++                        Label::new(run.id.split("__").last().unwrap_or(&run.id).to_string())
++                            .size(LabelSize::Small)
++                            .color(if selected { Color::Default } else { Color::Muted }),
++                    );
++                for entry in &run.entries {
++                    let (state, seen) = store
++                        .as_ref()
++                        .map(|s| (s.read(cx).state_of(entry), s.read(cx).is_seen(entry)))
++                        .unwrap_or((ArenaState::Waiting, false));
++                    let (color, glyph) = dot(state, seen, cx);
++                    row = row.child(
++                        h_flex()
++                            .gap_0p5()
++                            .child(div().text_color(color).text_xs().child(glyph))
++                            .child(
++                                Label::new(entry.label.clone())
++                                    .size(LabelSize::XSmall)
++                                    .color(Color::Muted),
++                            ),
++                    );
++                }
++                let id = run.id.clone();
++                row.on_click(cx.listener(move |this, _, _, cx| {
++                    this.selected_run = Some(id.clone());
++                    cx.notify();
++                }))
++            }))
++    }
++
++    fn render_column(&mut self, entry: &ArenaEntry, cx: &mut Context<Self>) -> impl IntoElement {
++        let colors = cx.theme().colors().clone();
++        let (state, seen) = self
++            .store
++            .as_ref()
++            .map(|s| (s.read(cx).state_of(entry), s.read(cx).is_seen(entry)))
++            .unwrap_or((ArenaState::Waiting, false));
++        let (color, glyph) = dot(state, seen, cx);
++        let mut header = vec![entry_summary(entry, state)];
++        if let Some(speed) = entry.tok_per_sec {
++            header.push(format!("{speed:.1}tok/s"));
++        }
++        let text = entry
++            .live
++            .as_ref()
++            .map(|path| model::tail(path, LIVE_TAIL_BYTES))
++            .unwrap_or_default();
++        let scroll = self
++            .scrolls
++            .entry(format!("{}::{}", entry.run, entry.label))
++            .or_default()
++            .clone();
++        let buffer_font = ThemeSettings::get_global(cx).buffer_font.family.clone();
++        v_flex()
++            .flex_1()
++            .min_w(px(220.))
++            .h_full()
++            .border_r_1()
++            .border_color(colors.border)
++            .child(
++                h_flex()
++                    .gap_1p5()
++                    .px_2()
++                    .py_1()
++                    .border_b_1()
++                    .border_color(colors.border)
++                    .bg(colors.toolbar_background)
++                    .child(div().text_color(color).child(glyph))
++                    .child(Label::new(entry.label.clone()).size(LabelSize::Small))
++                    .child(
++                        Label::new(header.join(" · "))
++                            .size(LabelSize::XSmall)
++                            .color(Color::Muted),
++                    ),
++            )
++            .child(
++                div()
++                    .id(SharedString::from(format!("arena-live-{}-{}", entry.run, entry.label)))
++                    .flex_1()
++                    .p_2()
++                    .overflow_y_scroll()
++                    .track_scroll(&scroll)
++                    .font_family(buffer_font)
++                    .text_xs()
++                    .text_color(colors.text)
++                    .child(if text.is_empty() {
++                        match state {
++                            ArenaState::Waiting => "앞 모델이 끝나기를 기다리는 중".to_string(),
++                            _ => "(아직 출력 없음)".to_string(),
++                        }
++                    } else {
++                        text
++                    }),
++            )
++    }
++}
++
++impl EventEmitter<()> for ArenaView {}
++
++impl Focusable for ArenaView {
++    fn focus_handle(&self, _: &App) -> FocusHandle {
++        self.focus_handle.clone()
++    }
++}
++
++impl Item for ArenaView {
++    type Event = ();
++
++    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
++        "코드 아레나".into()
++    }
++
++    fn tab_icon(&self, _: &Window, _: &App) -> Option<Icon> {
++        Some(Icon::new(IconName::Code))
++    }
++}
++
++impl Render for ArenaView {
++    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let run = self.current_run(cx);
++        if let (Some(run), Some(store)) = (&run, &self.store) {
++            let changed = store.update(cx, |store, _| store.mark_run_seen(run));
++            if changed {
++                cx.notify();
++            }
++        }
++        let colors = cx.theme().colors().clone();
++        let tabs = self
++            .render_run_tabs(run.as_ref().map(|r| r.id.as_str()), cx)
++            .into_any_element();
++        let body = match &run {
++            None => div()
++                .p_4()
++                .child(
++                    Label::new("최근 24시간 아레나 실행이 없습니다 (~/.harness/arena)")
++                        .color(Color::Muted),
++                )
++                .into_any_element(),
++            Some(run) => {
++                let mut columns = Vec::new();
++                for entry in &run.entries {
++                    columns.push(self.render_column(entry, cx).into_any_element());
++                }
++                h_flex()
++                    .flex_1()
++                    .w_full()
++                    .items_start()
++                    .overflow_hidden()
++                    .children(columns)
++                    .into_any_element()
++            }
++        };
++        v_flex()
++            .size_full()
++            .track_focus(&self.focus_handle)
++            .bg(colors.editor_background)
++            .child(tabs)
++            .child(body)
++    }
++}
++
++pub fn init(cx: &mut App) {
++    let store = cx.new(|cx| {
++        let poll = cx.spawn(async move |this, cx| {
++            loop {
++                let runs = cx
++                    .background_spawn(async move {
++                        arena_root()
++                            .map(|root| model::load_runs(&root, now_secs(), MAX_AGE_SECS))
++                            .unwrap_or_default()
++                    })
++                    .await;
++                let alive = this.update(cx, |store: &mut ArenaStore, cx| {
++                    let running = runs
++                        .iter()
++                        .flat_map(|run| &run.entries)
++                        .any(|entry| entry.state == "running");
++                    if store.runs != runs || running {
++                        store.runs = runs;
++                        cx.notify();
++                    }
++                });
++                if alive.is_err() {
++                    break;
++                }
++                cx.background_executor().timer(POLL).await;
++            }
++        });
++        ArenaStore {
++            runs: Vec::new(),
++            seen: HashSet::new(),
++            _poll: poll,
++        }
++    });
++    cx.set_global(GlobalArenaStore(store));
++    cx.observe_new(|workspace: &mut Workspace, _, _| {
++        workspace.register_action(|workspace, _: &OpenArena, window, cx| {
++            open_arena(workspace, None, window, cx);
++        });
++    })
++    .detach();
++}
+diff --git a/crates/arena_view/src/model.rs b/crates/arena_view/src/model.rs
+new file mode 100644
+index 0000000..4ef9d7c
+--- /dev/null
++++ b/crates/arena_view/src/model.rs
+@@ -0,0 +1,243 @@
++use std::collections::BTreeMap;
++use std::io::{Read, Seek, SeekFrom};
++use std::path::{Path, PathBuf};
++
++use serde_json::Value;
++
++pub const STALL_SECS: f64 = 60.;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ArenaState {
++    Waiting,
++    Running,
++    Done,
++    Failed,
++    Stalled,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct ArenaEntry {
++    pub run: String,
++    pub label: String,
++    pub model: String,
++    pub role: String,
++    pub state: String,
++    pub started: Option<f64>,
++    pub ended: Option<f64>,
++    pub tokens: u64,
++    pub tok_per_sec: Option<f64>,
++    pub live: Option<PathBuf>,
++    pub session: Option<String>,
++    pub pid: Option<u32>,
++    pub updated: f64,
++}
++
++impl ArenaEntry {
++    pub fn from_value(value: &Value) -> Option<Self> {
++        let text = |key: &str| value[key].as_str().map(str::to_string);
++        Some(Self {
++            run: text("run")?,
++            label: text("label")?,
++            model: text("model").unwrap_or_default(),
++            role: text("role").unwrap_or_default(),
++            state: text("state").unwrap_or_else(|| "waiting".into()),
++            started: value["started"].as_f64(),
++            ended: value["ended"].as_f64(),
++            tokens: value["tokens"].as_u64().unwrap_or(0),
++            tok_per_sec: value["tok_per_sec"].as_f64(),
++            live: text("live").map(PathBuf::from),
++            session: text("session"),
++            pid: value["pid"].as_u64().map(|pid| pid as u32),
++            updated: value["updated"].as_f64().unwrap_or(0.),
++        })
++    }
++
++    pub fn effective_state(&self, now: f64, pid_alive: impl Fn(u32) -> bool) -> ArenaState {
++        match self.state.as_str() {
++            "done" => ArenaState::Done,
++            "failed" => ArenaState::Failed,
++            state => {
++                let quiet = now - self.updated > STALL_SECS;
++                let dead = self.pid.is_some_and(|pid| !pid_alive(pid));
++                if quiet && dead {
++                    ArenaState::Stalled
++                } else if state == "running" {
++                    ArenaState::Running
++                } else {
++                    ArenaState::Waiting
++                }
++            }
++        }
++    }
++
++    pub fn elapsed(&self, now: f64) -> Option<f64> {
++        let started = self.started?;
++        Some((self.ended.unwrap_or(now) - started).max(0.))
++    }
++
++    pub fn role_label(&self) -> &str {
++        match self.role.as_str() {
++            "candidate" => "후보",
++            "detail" => "보강",
++            "base" => "기반",
++            other => other,
++        }
++    }
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct ArenaRun {
++    pub id: String,
++    pub entries: Vec<ArenaEntry>,
++    pub updated: f64,
++}
++
++impl ArenaRun {
++    pub fn session(&self) -> Option<&str> {
++        self.entries.iter().find_map(|entry| entry.session.as_deref())
++    }
++}
++
++pub fn load_runs(root: &Path, now: f64, max_age_secs: f64) -> Vec<ArenaRun> {
++    let Ok(dirs) = std::fs::read_dir(root) else {
++        return Vec::new();
++    };
++    let mut runs = Vec::new();
++    for dir in dirs.flatten() {
++        let path = dir.path();
++        if !path.is_dir() {
++            continue;
++        }
++        let mut entries: BTreeMap<String, ArenaEntry> = BTreeMap::new();
++        let Ok(files) = std::fs::read_dir(&path) else {
++            continue;
++        };
++        for file in files.flatten() {
++            let file = file.path();
++            if file.extension().and_then(|ext| ext.to_str()) != Some("json") {
++                continue;
++            }
++            let Some(entry) = std::fs::read_to_string(&file)
++                .ok()
++                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
++                .and_then(|value| ArenaEntry::from_value(&value))
++            else {
++                continue;
++            };
++            entries.insert(entry.label.clone(), entry);
++        }
++        let mut entries: Vec<ArenaEntry> = entries.into_values().collect();
++        if entries.is_empty() {
++            continue;
++        }
++        entries.sort_by(|a, b| {
++            a.started
++                .unwrap_or(f64::MAX)
++                .total_cmp(&b.started.unwrap_or(f64::MAX))
++                .then_with(|| a.label.cmp(&b.label))
++        });
++        let updated = entries.iter().map(|e| e.updated).fold(0., f64::max);
++        if now - updated > max_age_secs {
++            continue;
++        }
++        runs.push(ArenaRun {
++            id: entries[0].run.clone(),
++            entries,
++            updated,
++        });
++    }
++    runs.sort_by(|a, b| b.updated.total_cmp(&a.updated));
++    runs
++}
++
++pub fn tail(path: &Path, max_bytes: u64) -> String {
++    let Ok(mut file) = std::fs::File::open(path) else {
++        return String::new();
++    };
++    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
++    let start = len.saturating_sub(max_bytes);
++    if file.seek(SeekFrom::Start(start)).is_err() {
++        return String::new();
++    }
++    let mut bytes = Vec::new();
++    if file.read_to_end(&mut bytes).is_err() {
++        return String::new();
++    }
++    let text = String::from_utf8_lossy(&bytes).into_owned();
++    if start == 0 {
++        return text;
++    }
++    match text.find('\n') {
++        Some(newline) => text[newline + 1..].to_string(),
++        None => text,
++    }
++}
++
++pub fn format_elapsed(seconds: f64) -> String {
++    let seconds = seconds as u64;
++    if seconds < 60 {
++        format!("{seconds}s")
++    } else if seconds < 3600 {
++        format!("{}m{:02}s", seconds / 60, seconds % 60)
++    } else {
++        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn write(dir: &Path, run: &str, label: &str, json: &str) {
++        let path = dir.join(run);
++        std::fs::create_dir_all(&path).unwrap();
++        std::fs::write(path.join(format!("{label}.json")), json).unwrap();
++    }
++
++    #[test]
++    fn loads_runs_newest_first_and_skips_old() {
++        let dir = tempfile::tempdir().unwrap();
++        write(dir.path(), "a", "qwen", r#"{"run":"a","label":"qwen","role":"candidate","state":"done","started":10,"ended":40,"tokens":300,"updated":40}"#);
++        write(dir.path(), "a", "devstral", r#"{"run":"a","label":"devstral","role":"candidate","state":"running","started":20,"tokens":120,"updated":90,"session":"s1"}"#);
++        write(dir.path(), "b", "qwen", r#"{"run":"b","label":"qwen","state":"waiting","updated":95}"#);
++        write(dir.path(), "old", "qwen", r#"{"run":"old","label":"qwen","state":"done","updated":1}"#);
++        std::fs::write(dir.path().join("a").join("qwen.live.txt"), "x").unwrap();
++        let runs = load_runs(dir.path(), 100., 50.);
++        assert_eq!(runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
++        let a = &runs[1];
++        assert_eq!(a.entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["qwen", "devstral"]);
++        assert_eq!(a.session(), Some("s1"));
++        assert_eq!(a.entries[0].elapsed(100.), Some(30.));
++        assert_eq!(a.entries[1].elapsed(100.), Some(80.));
++        assert_eq!(a.entries[0].role_label(), "후보");
++    }
++
++    #[test]
++    fn stalled_needs_quiet_and_dead_pid() {
++        let value: Value = serde_json::from_str(
++            r#"{"run":"a","label":"q","state":"running","pid":42,"updated":0}"#,
++        )
++        .unwrap();
++        let entry = ArenaEntry::from_value(&value).unwrap();
++        assert_eq!(entry.effective_state(30., |_| false), ArenaState::Running);
++        assert_eq!(entry.effective_state(100., |_| true), ArenaState::Running);
++        assert_eq!(entry.effective_state(100., |_| false), ArenaState::Stalled);
++    }
++
++    #[test]
++    fn tail_starts_at_a_line_boundary() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("live.txt");
++        std::fs::write(&path, "첫째 줄\n둘째 줄\n셋째").unwrap();
++        assert_eq!(tail(&path, 1000), "첫째 줄\n둘째 줄\n셋째");
++        assert_eq!(tail(&path, 12), "셋째");
++        assert_eq!(tail(&dir.path().join("none"), 10), "");
++    }
++
++    #[test]
++    fn elapsed_format() {
++        assert_eq!(format_elapsed(32.), "32s");
++        assert_eq!(format_elapsed(125.), "2m05s");
++        assert_eq!(format_elapsed(3720.), "1h02m");
++    }
++}
+diff --git a/crates/title_bar/src/harness_usage.rs b/crates/title_bar/src/harness_usage.rs
+new file mode 100644
+index 0000000..338799c
+--- /dev/null
++++ b/crates/title_bar/src/harness_usage.rs
+@@ -0,0 +1,279 @@
++use std::path::{Path, PathBuf};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use chrono::{DateTime, Local, NaiveDate};
++use serde_json::Value;
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct UsageChip {
++    pub name: &'static str,
++    pub remaining_percent: Option<f64>,
++    pub resets_in: Option<Duration>,
++    pub note: Option<String>,
++}
++
++impl UsageChip {
++    fn empty(name: &'static str) -> Self {
++        Self {
++            name,
++            remaining_percent: None,
++            resets_in: None,
++            note: None,
++        }
++    }
++
++    pub fn label(&self) -> String {
++        let mut parts = Vec::new();
++        match (self.remaining_percent, &self.note) {
++            (Some(percent), _) => parts.push(format!("{}%", percent.round() as i64)),
++            (None, Some(note)) => parts.push(note.clone()),
++            (None, None) => parts.push("—".to_string()),
++        }
++        if let Some(duration) = self.resets_in {
++            parts.push(format_duration(duration));
++        }
++        format!("{} {}", self.name, parts.join(" · "))
++    }
++}
++
++pub fn format_duration(duration: Duration) -> String {
++    let minutes = duration.as_secs() / 60;
++    let (hours, minutes) = (minutes / 60, minutes % 60);
++    match (hours / 24, hours % 24) {
++        (0, 0) => format!("{minutes}분"),
++        (0, hours) => format!("{hours}시간{minutes:02}분"),
++        (days, hours) => format!("{days}일{hours}시간"),
++    }
++}
++
++fn epoch_seconds(time: SystemTime) -> f64 {
++    time.duration_since(UNIX_EPOCH)
++        .map(|d| d.as_secs_f64())
++        .unwrap_or_default()
++}
++
++fn until(reset_epoch: f64, now: SystemTime) -> Option<Duration> {
++    let left = reset_epoch - epoch_seconds(now);
++    (left > 0.).then(|| Duration::from_secs_f64(left))
++}
++
++fn window_chip(
++    name: &'static str,
++    used_percent: Option<f64>,
++    reset_epoch: Option<f64>,
++    now: SystemTime,
++) -> UsageChip {
++    let mut chip = UsageChip::empty(name);
++    let resets_in = reset_epoch.and_then(|epoch| until(epoch, now));
++    if reset_epoch.is_some() && resets_in.is_none() {
++        chip.remaining_percent = Some(100.);
++        return chip;
++    }
++    chip.remaining_percent = used_percent.map(|used| (100. - used).clamp(0., 100.));
++    chip.resets_in = resets_in;
++    chip
++}
++
++pub fn claude_chip(path: &Path, now: SystemTime) -> UsageChip {
++    let Some(value) = std::fs::read_to_string(path)
++        .ok()
++        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
++    else {
++        return UsageChip::empty("Claude");
++    };
++    let window = &value["five_hour"];
++    let reset = window["resets_at"]
++        .as_str()
++        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
++        .map(|time| time.timestamp() as f64);
++    window_chip("Claude", window["utilization"].as_f64(), reset, now)
++}
++
++fn latest_codex_rollout(sessions: &Path) -> Option<PathBuf> {
++    let mut newest: Option<(SystemTime, PathBuf)> = None;
++    let mut stack = vec![sessions.to_path_buf()];
++    let mut depth_limit = 4usize;
++    while let Some(dir) = stack.pop() {
++        let Ok(entries) = std::fs::read_dir(&dir) else {
++            continue;
++        };
++        let mut subdirs: Vec<PathBuf> = Vec::new();
++        for entry in entries.flatten() {
++            let path = entry.path();
++            if path.is_dir() {
++                subdirs.push(path);
++            } else if path
++                .file_name()
++                .and_then(|name| name.to_str())
++                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
++            {
++                let modified = entry
++                    .metadata()
++                    .and_then(|meta| meta.modified())
++                    .unwrap_or(UNIX_EPOCH);
++                if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
++                    newest = Some((modified, path));
++                }
++            }
++        }
++        if depth_limit > 0 {
++            subdirs.sort();
++            if let Some(last) = subdirs.pop() {
++                stack.push(last);
++            }
++            depth_limit -= 1;
++        }
++    }
++    newest.map(|(_, path)| path)
++}
++
++pub fn codex_chip(sessions: &Path, now: SystemTime) -> UsageChip {
++    let Some(text) = latest_codex_rollout(sessions).and_then(|path| std::fs::read_to_string(path).ok())
++    else {
++        return UsageChip::empty("GPT");
++    };
++    let limits = text.lines().rev().find_map(|line| {
++        if !line.contains("\"rate_limits\"") {
++            return None;
++        }
++        let value: Value = serde_json::from_str(line).ok()?;
++        find_key(&value, "rate_limits").filter(|limits| limits["primary"].is_object())
++    });
++    let Some(limits) = limits else {
++        return UsageChip::empty("GPT");
++    };
++    let primary = &limits["primary"];
++    window_chip(
++        "GPT",
++        primary["used_percent"].as_f64(),
++        primary["resets_at"].as_f64(),
++        now,
++    )
++}
++
++fn find_key(value: &Value, key: &str) -> Option<Value> {
++    match value {
++        Value::Object(map) => map
++            .get(key)
++            .cloned()
++            .or_else(|| map.values().find_map(|child| find_key(child, key))),
++        Value::Array(items) => items.iter().find_map(|child| find_key(child, key)),
++        _ => None,
++    }
++}
++
++pub fn jev_chip(path: &Path, today: NaiveDate) -> UsageChip {
++    let mut chip = UsageChip::empty("Jev");
++    let Ok(text) = std::fs::read_to_string(path) else {
++        return chip;
++    };
++    let mut tokens = 0u64;
++    for line in text.lines() {
++        let Ok(value) = serde_json::from_str::<Value>(line) else {
++            continue;
++        };
++        let same_day = value["ts"]
++            .as_str()
++            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
++            .is_some_and(|time| time.with_timezone(&Local).date_naive() == today);
++        if same_day {
++            tokens += value["input_tokens"].as_u64().unwrap_or(0)
++                + value["output_tokens"].as_u64().unwrap_or(0);
++        }
++    }
++    chip.note = Some(format!("오늘 {}", format_tokens(tokens)));
++    chip
++}
++
++fn format_tokens(tokens: u64) -> String {
++    if tokens >= 1_000_000 {
++        format!("{:.1}M토큰", tokens as f64 / 1_000_000.)
++    } else if tokens >= 1_000 {
++        format!("{:.1}k토큰", tokens as f64 / 1_000.)
++    } else {
++        format!("{tokens}토큰")
++    }
++}
++
++pub fn snapshot(now: SystemTime) -> Vec<UsageChip> {
++    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
++        return Vec::new();
++    };
++    vec![
++        claude_chip(&home.join(".harness/usage/claude.json"), now),
++        codex_chip(&home.join(".codex/sessions"), now),
++        jev_chip(&home.join(".harness/usage/jev.jsonl"), Local::now().date_naive()),
++    ]
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn at(epoch: u64) -> SystemTime {
++        UNIX_EPOCH + Duration::from_secs(epoch)
++    }
++
++    #[test]
++    fn claude_remaining_and_reset() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("claude.json");
++        std::fs::write(
++            &path,
++            r#"{"five_hour":{"utilization":75,"resets_at":"2026-10-30T04:30:00.000Z"},"seven_day":null,"updated":1}"#,
++        )
++        .unwrap();
++        let reset = DateTime::parse_from_rfc3339("2026-10-30T04:30:00Z").unwrap().timestamp() as u64;
++        let chip = claude_chip(&path, at(reset - 3 * 3600 - 12 * 60));
++        assert_eq!(chip.remaining_percent, Some(25.));
++        assert_eq!(chip.label(), "Claude 25% · 3시간12분");
++        let after = claude_chip(&path, at(reset + 10));
++        assert_eq!(after.label(), "Claude 100%");
++        assert_eq!(claude_chip(&dir.path().join("none.json"), at(0)).label(), "Claude —");
++    }
++
++    #[test]
++    fn codex_reads_latest_rollout_rate_limits() {
++        let dir = tempfile::tempdir().unwrap();
++        let day = dir.path().join("2026/10/30");
++        std::fs::create_dir_all(&day).unwrap();
++        std::fs::write(
++            day.join("rollout-a.jsonl"),
++            concat!(
++                r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0,"window_minutes":300,"resets_at":2000}}}}"#,
++                "\n",
++                r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":40.0,"window_minutes":300,"resets_at":5600},"secondary":{"used_percent":6.0}}}}"#,
++                "\n",
++                r#"{"type":"response_item","payload":{}}"#,
++                "\n",
++            ),
++        )
++        .unwrap();
++        let chip = codex_chip(dir.path(), at(2000));
++        assert_eq!(chip.label(), "GPT 60% · 1시간00분");
++    }
++
++    #[test]
++    fn jev_sums_today_tokens_only() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("jev.jsonl");
++        let today = Local::now();
++        let yesterday = today - chrono::Duration::days(1);
++        std::fs::write(
++            &path,
++            format!(
++                "{{\"ts\":\"{}\",\"input_tokens\":5400,\"output_tokens\":600}}\n{{\"ts\":\"{}\",\"input_tokens\":999999,\"output_tokens\":1}}\nnot json\n",
++                today.to_rfc3339(),
++                yesterday.to_rfc3339()
++            ),
++        )
++        .unwrap();
++        assert_eq!(jev_chip(&path, today.date_naive()).label(), "Jev 오늘 6.0k토큰");
++    }
++
++    #[test]
++    fn duration_formats() {
++        assert_eq!(format_duration(Duration::from_secs(59 * 60)), "59분");
++        assert_eq!(format_duration(Duration::from_secs(26 * 3600)), "1일2시간");
++    }
++}

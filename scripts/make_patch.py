@@ -17,7 +17,7 @@ for p in paths:
     own.append(p)
     src = str(a) if a.exists() else "/dev/null"
     r = subprocess.run(["git", "diff", "--no-index", "--no-color", src, str(b)], capture_output=True, text=True)
-    text = r.stdout.replace(f"a{a}", f"a/{p}").replace(f"b{b}", f"b/{p}").replace(f"a/{a}", f"a/{p}").replace(f"b/{b}", f"b/{p}")
+    text = r.stdout.replace(f"a{a}", f"a/{p}").replace(f"b{b}", f"b/{p}").replace(f"a/{a}", f"a/{p}").replace(f"b/{b}", f"b/{p}").replace(f"a{b}", f"a/{p}")
     chunks.append(text)
 out.write_text("".join(chunks))
 print(len(paths), "changed /", len(own), "own")
