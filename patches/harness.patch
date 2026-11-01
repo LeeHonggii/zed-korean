@@ -2438,7 +2438,7 @@ index 6d4b5b8..b8e2770 100644
  async-channel.workspace = true
  agent.workspace = true
 diff --git a/crates/sidebar/src/sidebar.rs b/crates/sidebar/src/sidebar.rs
-index 68e3099..9a4b954 100644
+index 68e3099..2199c92 100644
 --- a/crates/sidebar/src/sidebar.rs
 +++ b/crates/sidebar/src/sidebar.rs
 @@ -68,7 +68,8 @@ use util::path_list::PathList;
@@ -2630,7 +2630,7 @@ index 68e3099..9a4b954 100644
          for entry in row_entries {
              if let ListEntry::Thread(thread) = &entry {
                  if let Some(session_id) = &thread.metadata.session_id {
-@@ -6281,6 +6381,110 @@ impl Sidebar {
+@@ -6281,6 +6381,118 @@ impl Sidebar {
              .into_any_element()
      }
  
@@ -2714,9 +2714,17 @@ index 68e3099..9a4b954 100644
 +                        .hover(|el| el.bg(cx.theme().colors().element_hover))
 +                        .child(div().text_xs().text_color(color).child(glyph))
 +                        .child(
-+                            Label::new(entry.label.clone())
-+                                .size(LabelSize::XSmall)
-+                                .truncate(),
++                            Label::new(
++                                entry
++                                    .model
++                                    .split(':')
++                                    .next()
++                                    .filter(|name| !name.is_empty())
++                                    .unwrap_or(&entry.label)
++                                    .to_string(),
++                            )
++                            .size(LabelSize::XSmall)
++                            .truncate(),
 +                        )
 +                        .child(
 +                            Label::new(summary)
@@ -2741,7 +2749,7 @@ index 68e3099..9a4b954 100644
      fn render_thread(
          &self,
          ix: usize,
-@@ -6322,6 +6526,8 @@ impl Sidebar {
+@@ -6322,6 +6534,8 @@ impl Sidebar {
  
          let timestamp: SharedString = if is_empty_draft {
              SharedString::default()
@@ -2750,7 +2758,7 @@ index 68e3099..9a4b954 100644
          } else {
              format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
          };
-@@ -6350,6 +6556,10 @@ impl Sidebar {
+@@ -6350,6 +6564,10 @@ impl Sidebar {
              .when(is_draft, |this| {
                  this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
              })
@@ -2761,7 +2769,7 @@ index 68e3099..9a4b954 100644
              .status(thread.status)
              .is_remote(is_remote)
              .when_some(icon_svg, |this, svg| {
-@@ -7590,6 +7800,19 @@ impl Sidebar {
+@@ -7590,6 +7808,19 @@ impl Sidebar {
                          this.toggle_archive(&ToggleThreadHistory, window, cx);
                      })),
              )
@@ -2781,7 +2789,7 @@ index 68e3099..9a4b954 100644
              .child(div().flex_1())
              .child(self.render_recent_projects_button(cx))
      }
-@@ -8179,6 +8402,32 @@ fn all_thread_infos_for_workspace(
+@@ -8179,6 +8410,32 @@ fn all_thread_infos_for_workspace(
  
              let diff_stats = thread.action_log().read(cx).diff_stats(cx);
  
@@ -2814,7 +2822,7 @@ index 68e3099..9a4b954 100644
              Some(ActiveThreadInfo {
                  session_id,
                  title,
-@@ -8188,6 +8437,7 @@ fn all_thread_infos_for_workspace(
+@@ -8188,6 +8445,7 @@ fn all_thread_infos_for_workspace(
                  is_background,
                  is_title_generating,
                  diff_stats,
@@ -2896,7 +2904,7 @@ index 57aceb8..c137938 100644
  client = { workspace = true, features = ["test-support"] }
  gpui = { workspace = true, features = ["test-support"] }
 diff --git a/crates/title_bar/src/title_bar.rs b/crates/title_bar/src/title_bar.rs
-index fe8c9e3..0695e30 100644
+index fe8c9e3..fdaf6f3 100644
 --- a/crates/title_bar/src/title_bar.rs
 +++ b/crates/title_bar/src/title_bar.rs
 @@ -1,5 +1,6 @@
@@ -2971,7 +2979,7 @@ index fe8c9e3..0695e30 100644
  
          this
      }
-@@ -1216,6 +1242,51 @@ impl TitleBar {
+@@ -1216,6 +1242,60 @@ impl TitleBar {
              })
      }
  
@@ -2992,7 +3000,16 @@ index fe8c9e3..0695e30 100644
 +                    Some(left) if left < 50. => Color::Warning,
 +                    _ => Color::Muted,
 +                };
-+                Label::new(chip.label()).size(LabelSize::Small).color(color)
++                h_flex()
++                    .gap_1()
++                    .child(Label::new(chip.label()).size(LabelSize::Small).color(color))
++                    .when_some(chip.stale_label(), |el, stale| {
++                        el.child(
++                            Label::new(stale)
++                                .size(LabelSize::XSmall)
++                                .color(Color::Disabled),
++                        )
++                    })
 +            }))
 +    }
 +
@@ -3023,7 +3040,7 @@ index fe8c9e3..0695e30 100644
      pub fn render_user_menu_button(&mut self, cx: &mut Context<Self>) -> impl Element {
          let show_update_button = self.update_version.read(cx).show_update_in_menu_bar();
  
-@@ -1489,3 +1560,28 @@ mod tests {
+@@ -1489,3 +1569,28 @@ mod tests {
          );
      }
  }
@@ -3755,10 +3772,10 @@ index 0000000..7d62853
 +tempfile.workspace = true
 diff --git a/crates/arena_view/src/arena_view.rs b/crates/arena_view/src/arena_view.rs
 new file mode 100644
-index 0000000..c49a693
+index 0000000..b761a88
 --- /dev/null
 +++ b/crates/arena_view/src/arena_view.rs
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,485 @@
 +// 하네스 패치: 코드 아레나 실시간 화면 — ~/.harness/arena/<run>/<label>.json·.live.txt 를 읽어 모델 칸을 나란히 보여 준다.
 +mod model;
 +
@@ -3767,8 +3784,9 @@ index 0000000..c49a693
 +use std::time::{Duration, SystemTime, UNIX_EPOCH};
 +
 +use gpui::{
-+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, Hsla,
-+    Render, ScrollHandle, Task, Window, actions, div, px,
++    Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, EventEmitter,
++    FocusHandle, Focusable, Global, HighlightStyle, Hsla, Render, ScrollHandle, StyledText, Task,
++    Window, actions, div, pulsating_between, px,
 +};
 +use settings::Settings as _;
 +use theme_settings::ThemeSettings;
@@ -3821,7 +3839,10 @@ index 0000000..c49a693
 +    }
 +
 +    pub fn runs_for_session<'a>(&'a self, session: &'a str) -> impl Iterator<Item = &'a ArenaRun> {
-+        self.runs.iter().filter(move |run| run.session() == Some(session))
++        let now = now_secs();
++        self.runs
++            .iter()
++            .filter(move |run| run.session() == Some(session) && !run.folded(now))
 +    }
 +
 +    pub fn state_of(&self, entry: &ArenaEntry) -> ArenaState {
@@ -3867,6 +3888,98 @@ index 0000000..c49a693
 +        parts.push(format_elapsed(elapsed));
 +    }
 +    parts.join(" · ")
++}
++
++fn render_body(
++    entry: &ArenaEntry,
++    state: ArenaState,
++    text: &str,
++    buffer_font: SharedString,
++    cx: &App,
++) -> AnyElement {
++    let running = state == ArenaState::Running;
++    let cursor = || {
++        Label::new("▍")
++            .size(LabelSize::XSmall)
++            .color(Color::Accent)
++            .with_animation(
++                "arena-cursor",
++                Animation::new(Duration::from_millis(900))
++                    .repeat()
++                    .with_easing(pulsating_between(0.2, 1.0)),
++                |label, delta| label.alpha(delta),
++            )
++    };
++    if text.trim().is_empty() {
++        let note = match state {
++            ArenaState::Waiting => "앞 모델이 끝나기를 기다리는 중",
++            _ => "(아직 출력 없음)",
++        };
++        return h_flex()
++            .gap_1()
++            .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted))
++            .when(running, |el| el.child(cursor()))
++            .into_any_element();
++    }
++    if entry.role != "detail" {
++        return v_flex()
++            .font_family(buffer_font)
++            .child(model::strip_fences(text))
++            .when(running, |el| el.child(cursor()))
++            .into_any_element();
++    }
++    let code = HighlightStyle {
++        color: cx
++            .theme()
++            .syntax()
++            .style_for_name("string")
++            .and_then(|style| style.color)
++            .or(Some(cx.theme().colors().text_accent)),
++        background_color: Some(cx.theme().colors().element_background),
++        ..Default::default()
++    };
++    let muted = HighlightStyle {
++        color: Some(cx.theme().colors().text_disabled),
++        ..Default::default()
++    };
++    let items = model::detail_items(text);
++    let last = items.len().saturating_sub(1);
++    v_flex()
++        .gap_2()
++        .children(items.into_iter().enumerate().map(|(index, item)| {
++            let highlights: Vec<_> = item
++                .spans
++                .iter()
++                .filter_map(|(range, kind)| match kind {
++                    model::SpanKind::Code => Some((range.clone(), code)),
++                    model::SpanKind::Muted => Some((range.clone(), muted)),
++                    model::SpanKind::Plain => None,
++                })
++                .collect();
++            h_flex()
++                .items_start()
++                .gap_1p5()
++                .when_some(item.number.clone(), |el, number| {
++                    el.child(
++                        div()
++                            .flex_none()
++                            .min_w(px(22.))
++                            .font_family(buffer_font.clone())
++                            .text_color(cx.theme().colors().text_accent)
++                            .child(number),
++                    )
++                })
++                .child(
++                    h_flex()
++                        .flex_1()
++                        .min_w_0()
++                        .flex_wrap()
++                        .items_end()
++                        .child(StyledText::new(item.text).with_highlights(highlights))
++                        .when(running && index == last, |el| el.child(cursor())),
++                )
++        }))
++        .into_any_element()
 +}
 +
 +pub fn open_arena(
@@ -4036,17 +4149,9 @@ index 0000000..c49a693
 +                    .p_2()
 +                    .overflow_y_scroll()
 +                    .track_scroll(&scroll)
-+                    .font_family(buffer_font)
 +                    .text_xs()
 +                    .text_color(colors.text)
-+                    .child(if text.is_empty() {
-+                        match state {
-+                            ArenaState::Waiting => "앞 모델이 끝나기를 기다리는 중".to_string(),
-+                            _ => "(아직 출력 없음)".to_string(),
-+                        }
-+                    } else {
-+                        text
-+                    }),
++                    .child(render_body(entry, state, &text, buffer_font, cx)),
 +            )
 +    }
 +}
@@ -4158,10 +4263,10 @@ index 0000000..c49a693
 +}
 diff --git a/crates/arena_view/src/model.rs b/crates/arena_view/src/model.rs
 new file mode 100644
-index 0000000..4ef9d7c
+index 0000000..418a57d
 --- /dev/null
 +++ b/crates/arena_view/src/model.rs
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,426 @@
 +use std::collections::BTreeMap;
 +use std::io::{Read, Seek, SeekFrom};
 +use std::path::{Path, PathBuf};
@@ -4256,9 +4361,24 @@ index 0000000..4ef9d7c
 +    pub updated: f64,
 +}
 +
++pub const FOLD_AFTER_SECS: f64 = 3600.;
++
 +impl ArenaRun {
 +    pub fn session(&self) -> Option<&str> {
 +        self.entries.iter().find_map(|entry| entry.session.as_deref())
++    }
++
++    pub fn folded(&self, now: f64) -> bool {
++        let finished = self
++            .entries
++            .iter()
++            .all(|entry| entry.state == "done" || entry.state == "failed");
++        let last_end = self
++            .entries
++            .iter()
++            .map(|entry| entry.ended.unwrap_or(entry.updated))
++            .fold(0., f64::max);
++        finished && now - last_end > FOLD_AFTER_SECS
 +    }
 +}
 +
@@ -4348,6 +4468,118 @@ index 0000000..4ef9d7c
 +    }
 +}
 +
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SpanKind {
++    Plain,
++    Code,
++    Muted,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct DetailItem {
++    pub number: Option<String>,
++    pub text: String,
++    pub spans: Vec<(std::ops::Range<usize>, SpanKind)>,
++}
++
++const TEMPLATE_PREFIXES: [&str; 3] = ["문제 / 고친 코드(짧게):", "문제 / 고친 코드:", "문제 / 고친 코드"];
++const MUTED_PHRASES: [&str; 2] = ["확인 필요", "확인이 필요"];
++
++fn strip_template(rest: &str) -> &str {
++    let rest = rest.trim_start();
++    for prefix in TEMPLATE_PREFIXES {
++        if let Some(stripped) = rest.strip_prefix(prefix) {
++            return stripped.trim_start();
++        }
++    }
++    rest
++}
++
++fn split_number(line: &str) -> (Option<String>, &str) {
++    let trimmed = line.trim_start();
++    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
++    if digits.is_empty() {
++        return (None, line.trim());
++    }
++    let after = trimmed[digits.len()..].trim_start();
++    match after.strip_prefix('/') {
++        Some(rest) => (Some(digits), strip_template(rest)),
++        None => (None, line.trim()),
++    }
++}
++
++fn spans_of(text: &str) -> Vec<(std::ops::Range<usize>, SpanKind)> {
++    let mut spans = Vec::new();
++    let mut in_code = false;
++    let mut start = 0;
++    for (index, ch) in text.char_indices() {
++        if ch == '`' {
++            if index > start {
++                spans.push((start..index, if in_code { SpanKind::Code } else { SpanKind::Plain }));
++            }
++            in_code = !in_code;
++            start = index + 1;
++        }
++    }
++    if start < text.len() {
++        spans.push((start..text.len(), if in_code { SpanKind::Code } else { SpanKind::Plain }));
++    }
++    let mut out = Vec::new();
++    for (range, kind) in spans {
++        if kind != SpanKind::Plain {
++            out.push((range, kind));
++            continue;
++        }
++        let piece = &text[range.clone()];
++        let mut cursor = 0;
++        while let Some((at, phrase)) = MUTED_PHRASES
++            .iter()
++            .filter_map(|phrase| piece[cursor..].find(phrase).map(|at| (cursor + at, *phrase)))
++            .min_by_key(|(at, _)| *at)
++        {
++            if at > cursor {
++                out.push((range.start + cursor..range.start + at, SpanKind::Plain));
++            }
++            out.push((range.start + at..range.start + at + phrase.len(), SpanKind::Muted));
++            cursor = at + phrase.len();
++        }
++        if cursor < piece.len() {
++            out.push((range.start + cursor..range.end, SpanKind::Plain));
++        }
++    }
++    out
++}
++
++pub fn strip_fences(text: &str) -> String {
++    text.lines()
++        .filter(|line| !line.trim_start().starts_with("```"))
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++pub fn detail_items(text: &str) -> Vec<DetailItem> {
++    let mut items: Vec<DetailItem> = Vec::new();
++    for line in strip_fences(text).lines() {
++        if line.trim().is_empty() {
++            continue;
++        }
++        let (number, rest) = split_number(line);
++        if number.is_none() && let Some(last) = items.last_mut() {
++            last.text.push('\n');
++            last.text.push_str(rest);
++            last.spans = spans_of(&last.text);
++            continue;
++        }
++        let text = rest.to_string();
++        items.push(DetailItem {
++            number,
++            spans: spans_of(&text),
++            text,
++        });
++    }
++    items
++}
++
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
@@ -4404,13 +4636,69 @@ index 0000000..4ef9d7c
 +        assert_eq!(format_elapsed(125.), "2m05s");
 +        assert_eq!(format_elapsed(3720.), "1h02m");
 +    }
++
++    #[test]
++    fn detail_items_split_number_code_and_muted() {
++        let text = "```python\n36 / 문제 / 고친 코드(짧게): `out`이 비면 예외. `if out:` 추가, 확인 필요.\n이어지는 설명\n51 / 고정값 문제\n```";
++        let items = detail_items(text);
++        assert_eq!(items.len(), 2);
++        assert_eq!(items[0].number.as_deref(), Some("36"));
++        let first = &items[0];
++        let kinds: Vec<(&str, SpanKind)> = first
++            .spans
++            .iter()
++            .map(|(range, kind)| (&first.text[range.clone()], *kind))
++            .collect();
++        assert_eq!(kinds[0], ("out", SpanKind::Code));
++        assert!(kinds.contains(&("if out:", SpanKind::Code)));
++        assert!(kinds.contains(&("확인 필요", SpanKind::Muted)));
++        assert!(first.text.ends_with("이어지는 설명"));
++        assert_eq!(items[1].number.as_deref(), Some("51"));
++        assert_eq!(items[1].text, "고정값 문제");
++    }
++
++    #[test]
++    fn plain_line_without_number_stays_unnumbered() {
++        let items = detail_items("머리말 한 줄");
++        assert_eq!(items.len(), 1);
++        assert_eq!(items[0].number, None);
++        assert_eq!(strip_fences("```\nx\n```"), "x");
++    }
++
++    #[test]
++    fn run_folds_an_hour_after_everything_finished() {
++        let entry = |state: &str, ended: Option<f64>| ArenaEntry {
++            run: "r".into(),
++            label: state.into(),
++            model: String::new(),
++            role: "detail".into(),
++            state: state.into(),
++            started: Some(0.),
++            ended,
++            tokens: 0,
++            tok_per_sec: None,
++            live: None,
++            session: Some("s".into()),
++            pid: None,
++            updated: ended.unwrap_or(0.),
++        };
++        let done = ArenaRun { id: "r".into(), entries: vec![entry("done", Some(100.))], updated: 100. };
++        assert!(!done.folded(100. + 3000.));
++        assert!(done.folded(100. + 3700.));
++        let mixed = ArenaRun {
++            id: "r".into(),
++            entries: vec![entry("done", Some(100.)), entry("running", None)],
++            updated: 100.,
++        };
++        assert!(!mixed.folded(100_000.));
++    }
 +}
 diff --git a/crates/title_bar/src/harness_usage.rs b/crates/title_bar/src/harness_usage.rs
 new file mode 100644
-index 0000000..338799c
+index 0000000..eefb7d7
 --- /dev/null
 +++ b/crates/title_bar/src/harness_usage.rs
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,320 @@
 +use std::path::{Path, PathBuf};
 +use std::time::{Duration, SystemTime, UNIX_EPOCH};
 +
@@ -4423,6 +4711,7 @@ index 0000000..338799c
 +    pub remaining_percent: Option<f64>,
 +    pub resets_in: Option<Duration>,
 +    pub note: Option<String>,
++    pub stale_for: Option<Duration>,
 +}
 +
 +impl UsageChip {
@@ -4432,7 +4721,18 @@ index 0000000..338799c
 +            remaining_percent: None,
 +            resets_in: None,
 +            note: None,
++            stale_for: None,
 +        }
++    }
++
++    pub fn stale_label(&self) -> Option<String> {
++        let age = self.stale_for?;
++        let hours = age.as_secs() / 3600;
++        Some(if hours >= 24 {
++            format!("{}일 전 기준", hours / 24)
++        } else {
++            format!("{hours}시간 전 기준")
++        })
 +    }
 +
 +    pub fn label(&self) -> String {
@@ -4502,66 +4802,70 @@ index 0000000..338799c
 +    window_chip("Claude", window["utilization"].as_f64(), reset, now)
 +}
 +
-+fn latest_codex_rollout(sessions: &Path) -> Option<PathBuf> {
-+    let mut newest: Option<(SystemTime, PathBuf)> = None;
-+    let mut stack = vec![sessions.to_path_buf()];
-+    let mut depth_limit = 4usize;
-+    while let Some(dir) = stack.pop() {
-+        let Ok(entries) = std::fs::read_dir(&dir) else {
-+            continue;
-+        };
-+        let mut subdirs: Vec<PathBuf> = Vec::new();
-+        for entry in entries.flatten() {
-+            let path = entry.path();
-+            if path.is_dir() {
-+                subdirs.push(path);
-+            } else if path
-+                .file_name()
-+                .and_then(|name| name.to_str())
-+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
-+            {
-+                let modified = entry
-+                    .metadata()
-+                    .and_then(|meta| meta.modified())
-+                    .unwrap_or(UNIX_EPOCH);
-+                if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
-+                    newest = Some((modified, path));
-+                }
-+            }
-+        }
-+        if depth_limit > 0 {
-+            subdirs.sort();
-+            if let Some(last) = subdirs.pop() {
-+                stack.push(last);
-+            }
-+            depth_limit -= 1;
-+        }
-+    }
-+    newest.map(|(_, path)| path)
++const CODEX_SCAN_FILES: usize = 30;
++const STALE_AFTER: Duration = Duration::from_secs(3600);
++
++fn sorted_children(dir: &Path) -> Vec<PathBuf> {
++    let mut children: Vec<PathBuf> = std::fs::read_dir(dir)
++        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
++        .unwrap_or_default();
++    children.sort();
++    children.reverse();
++    children
 +}
 +
-+pub fn codex_chip(sessions: &Path, now: SystemTime) -> UsageChip {
-+    let Some(text) = latest_codex_rollout(sessions).and_then(|path| std::fs::read_to_string(path).ok())
-+    else {
-+        return UsageChip::empty("GPT");
-+    };
-+    let limits = text.lines().rev().find_map(|line| {
++fn recent_codex_rollouts(dir: &Path, limit: usize, found: &mut Vec<PathBuf>) {
++    for child in sorted_children(dir) {
++        if found.len() >= limit {
++            return;
++        }
++        if child.is_dir() {
++            recent_codex_rollouts(&child, limit, found);
++        } else if child
++            .file_name()
++            .and_then(|name| name.to_str())
++            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
++        {
++            found.push(child);
++        }
++    }
++}
++
++fn last_rate_limits(text: &str) -> Option<(Value, Option<f64>)> {
++    text.lines().rev().find_map(|line| {
 +        if !line.contains("\"rate_limits\"") {
 +            return None;
 +        }
 +        let value: Value = serde_json::from_str(line).ok()?;
-+        find_key(&value, "rate_limits").filter(|limits| limits["primary"].is_object())
-+    });
-+    let Some(limits) = limits else {
++        let limits = find_key(&value, "rate_limits").filter(|limits| limits["primary"].is_object())?;
++        let at = value["timestamp"]
++            .as_str()
++            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
++            .map(|time| time.timestamp() as f64);
++        Some((limits, at))
++    })
++}
++
++pub fn codex_chip(sessions: &Path, now: SystemTime) -> UsageChip {
++    let mut files = Vec::new();
++    recent_codex_rollouts(sessions, CODEX_SCAN_FILES, &mut files);
++    let Some((limits, recorded_at)) = files
++        .iter()
++        .find_map(|path| std::fs::read_to_string(path).ok().and_then(|text| last_rate_limits(&text)))
++    else {
 +        return UsageChip::empty("GPT");
 +    };
 +    let primary = &limits["primary"];
-+    window_chip(
++    let mut chip = window_chip(
 +        "GPT",
 +        primary["used_percent"].as_f64(),
 +        primary["resets_at"].as_f64(),
 +        now,
-+    )
++    );
++    chip.stale_for = recorded_at
++        .map(|at| Duration::from_secs_f64((epoch_seconds(now) - at).max(0.)))
++        .filter(|age| *age >= STALE_AFTER);
++    chip
 +}
 +
 +fn find_key(value: &Value, key: &str) -> Option<Value> {
@@ -4664,6 +4968,31 @@ index 0000000..338799c
 +        .unwrap();
 +        let chip = codex_chip(dir.path(), at(2000));
 +        assert_eq!(chip.label(), "GPT 60% · 1시간00분");
++    }
++
++    #[test]
++    fn codex_skips_newest_rollout_without_rate_limits() {
++        let dir = tempfile::tempdir().unwrap();
++        let day = dir.path().join("2026/10/30");
++        std::fs::create_dir_all(&day).unwrap();
++        std::fs::write(
++            day.join("rollout-2026-10-30T17-00-00-a.jsonl"),
++            concat!(
++                r#"{"timestamp":"1970-01-01T00:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":30.0,"resets_at":20000}}}}"#,
++                "\n"
++            ),
++        )
++        .unwrap();
++        std::fs::write(
++            day.join("rollout-2026-10-30T17-09-00-b.jsonl"),
++            r#"{"timestamp":"1970-01-01T00:00:00Z","payload":{"type":"exec"}}"#,
++        )
++        .unwrap();
++        let chip = codex_chip(dir.path(), at(2 * 3600));
++        assert_eq!(chip.remaining_percent, Some(70.));
++        assert_eq!(chip.stale_label().as_deref(), Some("2시간 전 기준"));
++        let fresh = codex_chip(dir.path(), at(600));
++        assert_eq!(fresh.stale_label(), None);
 +    }
 +
 +    #[test]

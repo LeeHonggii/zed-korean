@@ -1,5 +1,5 @@
 diff --git a/src/acp-agent.ts b/src/acp-agent.ts
-index 90a8254..1b2b56f 100644
+index 90a8254..5e999ac 100644
 --- a/src/acp-agent.ts
 +++ b/src/acp-agent.ts
 @@ -154,6 +154,7 @@ import type {
@@ -16,7 +16,7 @@ index 90a8254..1b2b56f 100644
  } from "./async-tasks.js";
 +import { HarnessActivity } from "./harness-activity.js";
 +import { bangCommand, runBangCommand } from "./harness-bash.js";
-+import { recordClaudeUsage } from "./harness-usage.js";
++import { recordClaudeUsage, recordRateLimitInfo } from "./harness-usage.js";
  import {
    AUTH_STATUS_PROBE_TIMEOUT_MS,
    AUTH_STATUS_UPDATE_METHOD,
@@ -159,7 +159,15 @@ index 90a8254..1b2b56f 100644
                  // A task moved to the background no longer blocks the tool
                  // call that spawned it, nor its requests the foreground work.
                  if (message.patch.is_backgrounded !== undefined) {
-@@ -9393,7 +9457,7 @@ export class ClaudeAcpAgent {
+@@ -8525,6 +8589,7 @@ export class ClaudeAcpAgent {
+             break;
+           }
+           case "rate_limit_event": {
++            void recordRateLimitInfo(message.rate_limit_info);
+             if (lastAssistantTotalUsage !== null) {
+               await sendUpdate({
+                 sessionId: params.sessionId,
+@@ -9393,7 +9458,7 @@ export class ClaudeAcpAgent {
    ): Promise<void> {
      const replayStartedAt = performance.now();
      const toolUseCache: ToolUseCache = {};
@@ -168,7 +176,7 @@ index 90a8254..1b2b56f 100644
      const historyLoadedAt = performance.now();
      this.logger.log(
        `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
-@@ -11584,11 +11648,16 @@ export class ClaudeAcpAgent {
+@@ -11584,11 +11649,16 @@ export class ClaudeAcpAgent {
  
    /** Whether the session forwards the text and the thinking of a subagent. */
    private forwardsSubagentText(meta: NewSessionRequest["_meta"]): boolean {
@@ -379,10 +387,10 @@ index 0000000..ead18a3
 +}
 diff --git a/src/harness-usage.ts b/src/harness-usage.ts
 new file mode 100644
-index 0000000..822af40
+index 0000000..7b67aea
 --- /dev/null
 +++ b/src/harness-usage.ts
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,92 @@
 +import { mkdir, rename, writeFile } from "node:fs/promises";
 +import { homedir } from "node:os";
 +import { dirname, join } from "node:path";
@@ -434,13 +442,45 @@ index 0000000..822af40
 +    ]);
 +    const snapshot = summarizeUsage(usage, now);
 +    if (!snapshot) return;
-+    const file = usageFile();
-+    await mkdir(dirname(file), { recursive: true });
-+    const tmp = `${file}.${process.pid}.tmp`;
-+    await writeFile(tmp, JSON.stringify(snapshot));
-+    await rename(tmp, file);
++    await writeSnapshot(snapshot);
 +  } catch {
 +    lastRecordedAt = 0;
++  }
++}
++
++/** 하네스 패치: 매 응답의 rate_limit_event(unifiedWindows)를 사용량 스냅샷으로 바꾼다. */
++export function snapshotFromRateLimit(info: unknown, now: number): ClaudeUsageSnapshot | null {
++  const windows = (info as { unifiedWindows?: Record<string, unknown> } | null)?.unifiedWindows;
++  if (!windows || typeof windows !== "object") return null;
++  const pick = (value: unknown): Window => {
++    if (!value || typeof value !== "object") return null;
++    const window = value as { utilization?: unknown; resetsAt?: unknown };
++    return {
++      utilization: typeof window.utilization === "number" ? window.utilization * 100 : null,
++      resets_at:
++        typeof window.resetsAt === "number" ? new Date(window.resetsAt * 1000).toISOString() : null,
++    };
++  };
++  return { five_hour: pick(windows.five_hour), seven_day: pick(windows.seven_day), updated: now / 1000 };
++}
++
++async function writeSnapshot(snapshot: ClaudeUsageSnapshot): Promise<void> {
++  const file = usageFile();
++  await mkdir(dirname(file), { recursive: true });
++  const tmp = `${file}.${process.pid}.tmp`;
++  await writeFile(tmp, JSON.stringify(snapshot));
++  await rename(tmp, file);
++}
++
++/** 하네스 패치: 응답마다 오는 사용량 이벤트를 바로 파일로 남긴다(추가 요청 없음). */
++export async function recordRateLimitInfo(info: unknown): Promise<void> {
++  if (process.env.CLAUDE_ACP_HIDE_USAGE === "1") return;
++  const snapshot = snapshotFromRateLimit(info, Date.now());
++  if (!snapshot) return;
++  try {
++    await writeSnapshot(snapshot);
++  } catch {
++    return;
 +  }
 +}
 diff --git a/src/resumed-session.ts b/src/resumed-session.ts
@@ -620,12 +660,12 @@ index 477b9ed..a44b46f 100644
        sources.resumed,
 diff --git a/src/tests/harness-usage.test.ts b/src/tests/harness-usage.test.ts
 new file mode 100644
-index 0000000..4600f87
+index 0000000..4b680e6
 --- /dev/null
 +++ b/src/tests/harness-usage.test.ts
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,59 @@
 +import { describe, it, expect } from "vitest";
-+import { summarizeUsage } from "../harness-usage.js";
++import { snapshotFromRateLimit, summarizeUsage } from "../harness-usage.js";
 +
 +describe("summarizeUsage", () => {
 +  it("keeps the five hour and seven day windows", () => {
@@ -657,5 +697,29 @@ index 0000000..4600f87
 +      seven_day: null,
 +      updated: 0,
 +    });
++  });
++});
++
++describe("snapshotFromRateLimit", () => {
++  it("converts unified windows to percent and ISO reset times", () => {
++    const snapshot = snapshotFromRateLimit(
++      {
++        status: "allowed",
++        unifiedWindows: {
++          five_hour: { utilization: 0.75, resetsAt: 1_793_334_600, status: "allowed" },
++          seven_day: { utilization: 0.1, resetsAt: 1_793_527_200, status: "allowed" },
++        },
++      },
++      1_793_300_000_000,
++    );
++    expect(snapshot).toEqual({
++      five_hour: { utilization: 75, resets_at: "2026-10-30T04:30:00.000Z" },
++      seven_day: { utilization: 10, resets_at: "2026-11-01T10:00:00.000Z" },
++      updated: 1_793_300_000,
++    });
++  });
++
++  it("ignores events without unified windows", () => {
++    expect(snapshotFromRateLimit({ status: "allowed" }, 0)).toBeNull();
 +  });
 +});
