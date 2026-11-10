@@ -55,6 +55,7 @@ update_claude_adapter() {
 
   git -C "$ACP_DIR" fetch --quiet origin "refs/tags/$latest:refs/tags/$latest"
   git -C "$ACP_DIR" worktree remove --force "$TRIAL" 2>/dev/null || rm -rf "$TRIAL"
+  git -C "$ACP_DIR" worktree prune
   git -C "$ACP_DIR" worktree add --detach "$TRIAL" "$latest" >/dev/null
   if ! (cd "$TRIAL" && git apply --3way --whitespace=nowarn "$PATCH"); then
     notify "Claude 어댑터 $latest 적용 실패" "패치 충돌: $(cd "$TRIAL" && git diff --name-only --diff-filter=U | tr '\n' ' ')— 지금 버전 유지"
@@ -106,12 +107,12 @@ update_claude_engine() {
 
 update_codex_adapter() {
   local current latest
-  current="$(grep -o '@zed-industries/codex-acp@[0-9][0-9.]*' "$SETTINGS" | head -1 | cut -d@ -f3)"
-  latest="$(npm view @zed-industries/codex-acp version 2>/dev/null)"
+  current="$(grep -o '@agentclientprotocol/codex-acp@[0-9][0-9.]*' "$SETTINGS" | head -1 | cut -d@ -f3)"
+  latest="$(npm view @agentclientprotocol/codex-acp version 2>/dev/null)"
   echo "-- Codex 어댑터: 지금 $current · 최신 $latest"
   [ -z "$latest" ] || [ "$latest" = "$current" ] && return 0
-  if (cd /tmp && "$PY" -I "$SMOKE" "$NPX" -y "@zed-industries/codex-acp@$latest"); then
-    sed -i '' "s/@zed-industries\/codex-acp@$current/@zed-industries\/codex-acp@$latest/" "$SETTINGS"
+  if (cd /tmp && "$PY" -I "$SMOKE" "$NPX" -y "@agentclientprotocol/codex-acp@$latest"); then
+    sed -i '' "s/@agentclientprotocol\/codex-acp@$current/@agentclientprotocol\/codex-acp@$latest/" "$SETTINGS"
     notify "Codex 어댑터 $latest" "업데이트됨 (새 대화부터)"
   else
     notify "Codex 어댑터 $latest 시험 실패" "지금 $current 유지"

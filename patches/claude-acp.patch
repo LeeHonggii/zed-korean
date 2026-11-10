@@ -1,8 +1,8 @@
 diff --git a/src/acp-agent.ts b/src/acp-agent.ts
-index 90a8254..5e999ac 100644
+index f6948f3..16433dc 100644
 --- a/src/acp-agent.ts
 +++ b/src/acp-agent.ts
-@@ -154,6 +154,7 @@ import type {
+@@ -155,6 +155,7 @@ import type {
    RenameSessionRequest,
    SessionIdRequest,
  } from "./session-index/service.js";
@@ -10,34 +10,38 @@ index 90a8254..5e999ac 100644
  import type {
    ListSubscribeRequest,
    ListUnsubscribeRequest,
-@@ -164,6 +165,9 @@ import {
-   backgroundedBashToolCallIds,
-   clientSupportsAsyncTasks,
- } from "./async-tasks.js";
+@@ -174,6 +175,10 @@ import {
+   cancelBackgroundWork,
+   SessionBackgroundWork,
+ } from "./background-work.js";
 +import { HarnessActivity } from "./harness-activity.js";
 +import { bangCommand, runBangCommand } from "./harness-bash.js";
++import { RESUME_PROMPT, formatClock, resumeDelayMs } from "./harness-autoresume.js";
 +import { recordClaudeUsage, recordRateLimitInfo } from "./harness-usage.js";
  import {
    AUTH_STATUS_PROBE_TIMEOUT_MS,
    AUTH_STATUS_UPDATE_METHOD,
-@@ -221,6 +225,7 @@ import {
+@@ -233,6 +238,7 @@ import {
    readResumedSession,
    readResumedTail,
    type ResumedSessionSnapshot,
 +  getFullSessionMessages,
  } from "./resumed-session.js";
  import { SessionTiming } from "./session-timing.js";
- import { ALLOW_BYPASS } from "./permissions/modes.js";
-@@ -1483,6 +1488,8 @@ export type Session = {
+ import { ALLOW_BYPASS, autoModeDisabled } from "./permissions/modes.js";
+@@ -1528,6 +1534,11 @@ export type Session = {
    /** Session-owned async task controller. Prompt cancellation intentionally
     *  does not finish it because background work may outlive a prompt. */
    asyncTaskRuntime?: AsyncTaskRuntime;
 +  harnessActivity?: HarnessActivity;
 +  harnessBashContext?: string;
++  /** 하네스 패치: 사용량 한도로 끝난 턴의 한도 문구(자동 재개 예약용). */
++  harnessUsageLimitText?: string;
++  harnessResumeTimer?: ReturnType<typeof setTimeout>;
    /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
     *  hand it the retained summary. */
    contextCompaction?: ContextCompactionLifecycle;
-@@ -3244,13 +3251,17 @@ export class ClaudeAcpAgent {
+@@ -3305,13 +3316,17 @@ export class ClaudeAcpAgent {
        offset,
      });
      const page = this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
@@ -56,11 +60,15 @@ index 90a8254..5e999ac 100644
          updatedAt: new Date(session.lastModified).toISOString(),
        });
      }
-@@ -3827,11 +3838,33 @@ export class ClaudeAcpAgent {
-    * outcome of a turn is field for field a v1 prompt response.
-    */
-   async prompt(params: PromptRequest): Promise<PromptResponse> {
+@@ -3904,14 +3919,71 @@ export class ClaudeAcpAgent {
+         );
+       }
+     }
 +    const session = this.sessions[params.sessionId];
++    if (session?.harnessResumeTimer) {
++      clearTimeout(session.harnessResumeTimer);
++      session.harnessResumeTimer = undefined;
++    }
 +    const bang = session ? bangCommand(params.prompt) : undefined;
 +    if (session && bang !== undefined) {
 +      const record = await runBangCommand(bang, session.cwd, async (update) =>
@@ -82,15 +90,49 @@ index 90a8254..5e999ac 100644
      const outcome = new Promise<TurnOutcome>((resolve, reject) => {
        events = { inserted() {}, ended: resolve, failed: reject };
      });
-     await this.startTurn(params, events);
+     await this.startTurn(params, events, origin);
 +    void outcome.then(
 +      () => recordClaudeUsage(this.sessions[params.sessionId]?.query),
 +      () => {},
 +    );
++    void outcome.finally(() => this.harnessMaybeScheduleResume(params.sessionId)).catch(() => {});
      return outcome;
    }
  
-@@ -4680,6 +4713,14 @@ export class ClaudeAcpAgent {
++  /** 하네스 패치: 사용량 한도로 끝난 턴이면 한도가 풀리는 시각에 같은 세션으로 「이어서」를 보낸다. */
++  private harnessMaybeScheduleResume(sessionId: string): void {
++    const session = this.sessions[sessionId];
++    const text = session?.harnessUsageLimitText;
++    if (!session || !text) return;
++    session.harnessUsageLimitText = undefined;
++    const notice = (msg: string) =>
++      this.client
++        .sessionUpdate({
++          sessionId,
++          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: msg } },
++        })
++        .catch(() => {});
++    const wait = resumeDelayMs(text);
++    if (wait === null) {
++      void notice("\n\n⏰ 한도가 풀리는 시각을 읽지 못해 자동 재개를 걸지 않았습니다.");
++      return;
++    }
++    const at = new Date(Date.now() + wait);
++    void notice(
++      `\n\n⏰ 사용량 한도 — ${formatClock(at)}에 이 대화를 자동으로 이어서 진행합니다. 그 전에 메시지를 보내면 예약은 취소됩니다.`,
++    );
++    session.harnessResumeTimer = setTimeout(() => {
++      session.harnessResumeTimer = undefined;
++      void this.prompt({ sessionId, prompt: [{ type: "text", text: RESUME_PROMPT }] } as PromptRequest).catch(
++        () => {},
++      );
++    }, wait);
++  }
++
+   /**
+    * Starts a turn for a prompt. Resolves once the prompt is queued for Claude
+    * Code, and rejects only when the prompt is refused before that. From then
+@@ -4774,6 +4846,14 @@ export class ClaudeAcpAgent {
       *  `tool_use_id` so hosts can collapse them; a notice has no lifecycle to
       *  update, so only the first becomes one. */
      const noticedToolUses = new Set<string>();
@@ -105,7 +147,7 @@ index 90a8254..5e999ac 100644
      const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
        clientSupportsAsyncTasks(this.clientCapabilities),
        params.sessionId,
-@@ -6638,8 +6679,12 @@ export class ClaudeAcpAgent {
+@@ -6756,8 +6836,12 @@ export class ClaudeAcpAgent {
                  break;
                }
                case "hook_started":
@@ -118,8 +160,8 @@ index 90a8254..5e999ac 100644
 +              case "hook_progress":
                case "files_persisted":
                  break;
-               case "task_progress":
-@@ -6698,6 +6743,11 @@ export class ClaudeAcpAgent {
+               case "task_progress": {
+@@ -6826,6 +6910,11 @@ export class ClaudeAcpAgent {
                    },
                    sendUpdate,
                  );
@@ -131,7 +173,7 @@ index 90a8254..5e999ac 100644
                  await asyncTasks.taskStarted({
                    task_id: message.task_id,
                    task_type: message.task_type,
-@@ -6729,6 +6779,7 @@ export class ClaudeAcpAgent {
+@@ -6857,6 +6946,7 @@ export class ClaudeAcpAgent {
                    message.tool_use_id,
                    { reason: message.reason },
                  );
@@ -139,7 +181,7 @@ index 90a8254..5e999ac 100644
                  await asyncTasks.taskNotification({
                    task_id: message.task_id,
                    status: message.status,
-@@ -6756,6 +6807,19 @@ export class ClaudeAcpAgent {
+@@ -6884,6 +6974,19 @@ export class ClaudeAcpAgent {
                    break;
                  }
                  await asyncTasks.taskUpdated(message.task_id, message.patch);
@@ -159,15 +201,26 @@ index 90a8254..5e999ac 100644
                  // A task moved to the background no longer blocks the tool
                  // call that spawned it, nor its requests the foreground work.
                  if (message.patch.is_backgrounded !== undefined) {
-@@ -8525,6 +8589,7 @@ export class ClaudeAcpAgent {
+@@ -7706,6 +7809,10 @@ export class ClaudeAcpAgent {
+               // cancelled: the session's list row shows `error` once idle.
+               session.lastTurnFailed =
+                 !session.cancelled && (message.is_error || message.subtype !== "success");
++              if (lastAssistantWasUsageLimit && !session.cancelled) {
++                session.harnessUsageLimitText =
++                  lastAssistantFailureTitle ?? ("result" in message ? String(message.result) : "");
++              }
+               this.sessionIndex.onOwnSessionChanged(params.sessionId);
+ 
+               if (!message.is_error && lastAssistantModel !== null) {
+@@ -8719,6 +8826,7 @@ export class ClaudeAcpAgent {
              break;
            }
            case "rate_limit_event": {
 +            void recordRateLimitInfo(message.rate_limit_info);
-             if (lastAssistantTotalUsage !== null) {
-               await sendUpdate({
-                 sessionId: params.sessionId,
-@@ -9393,7 +9458,7 @@ export class ClaudeAcpAgent {
+             session.idleCompaction?.noteRateLimit(message.rate_limit_info);
+             // With partial messages on, the SDK sends this before the turn's
+             // first assistant frame, while there is no usage yet to send it with.
+@@ -9687,7 +9795,7 @@ export class ClaudeAcpAgent {
    ): Promise<void> {
      const replayStartedAt = performance.now();
      const toolUseCache: ToolUseCache = {};
@@ -176,7 +229,7 @@ index 90a8254..5e999ac 100644
      const historyLoadedAt = performance.now();
      this.logger.log(
        `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
-@@ -11584,11 +11649,16 @@ export class ClaudeAcpAgent {
+@@ -11968,11 +12076,16 @@ export class ClaudeAcpAgent {
  
    /** Whether the session forwards the text and the thinking of a subagent. */
    private forwardsSubagentText(meta: NewSessionRequest["_meta"]): boolean {
@@ -291,6 +344,45 @@ index 0000000..a564440
 +      return;
 +    }
 +  }
++}
+diff --git a/src/harness-autoresume.ts b/src/harness-autoresume.ts
+new file mode 100644
+index 0000000..d59d088
+--- /dev/null
++++ b/src/harness-autoresume.ts
+@@ -0,0 +1,33 @@
++const RESUME_GRACE_MS = 90 * 1000;
++const MAX_WAIT_MS = 6 * 60 * 60 * 1000;
++
++export const RESUME_PROMPT =
++  "[자동 재개] 사용량 한도가 풀려서 이어서 진행한다. 멈추기 직전에 하던 작업을 확인하고 끝까지 이어서 하라. " +
++  "한도 때문에 멈춘 서브에이전트가 있으면 새로 띄우지 말고 SendMessage 로 멈춘 곳부터 이어 가게 하라. " +
++  "사용자에게 새로 물을 것이 없으면 묻지 말고 진행한다.";
++
++/** 하네스 패치: 「resets 3:40pm」 같은 한도 문구에서 다음 재개 시각을 구한다. 못 읽으면 null. */
++export function parseResetTime(text: string | undefined | null, now: Date = new Date()): Date | null {
++  if (!text) return null;
++  const m = /resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i.exec(text);
++  if (!m) return null;
++  let hour = Number(m[1]) % 12;
++  if (m[3].toLowerCase() === "pm") hour += 12;
++  const at = new Date(now);
++  at.setHours(hour, Number(m[2] ?? 0), 0, 0);
++  if (at.getTime() <= now.getTime()) at.setDate(at.getDate() + 1);
++  return at;
++}
++
++/** 하네스 패치: 재개까지 기다릴 시간(ms). 너무 멀거나 못 읽으면 null. */
++export function resumeDelayMs(text: string | undefined | null, now: Date = new Date()): number | null {
++  if (process.env.HARNESS_AUTO_RESUME === "0") return null;
++  const at = parseResetTime(text, now);
++  if (!at) return null;
++  const wait = at.getTime() - now.getTime() + RESUME_GRACE_MS;
++  return wait > 0 && wait <= MAX_WAIT_MS ? wait : null;
++}
++
++export function formatClock(date: Date): string {
++  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 +}
 diff --git a/src/harness-bash.ts b/src/harness-bash.ts
 new file mode 100644
@@ -610,7 +702,7 @@ index 0000000..77486f0
 +  return patterns().some((p) => t.includes(p));
 +}
 diff --git a/src/session-index/service.ts b/src/session-index/service.ts
-index 75b4bd7..a5acf8a 100644
+index 29dea4c..0740056 100644
 --- a/src/session-index/service.ts
 +++ b/src/session-index/service.ts
 @@ -20,6 +20,7 @@ import {
@@ -621,7 +713,7 @@ index 75b4bd7..a5acf8a 100644
  import type { OwnSessionState } from "./activity.js";
  import {
    effectiveTitle,
-@@ -508,7 +509,8 @@ export class SessionIndexService {
+@@ -500,7 +501,8 @@ export class SessionIndexService {
      own: (sessionId: string) => OwnSessionState | undefined,
    ): Promise<ListSessionsResponse> {
      const { limit, archived, includeWorktrees } = parseListOptions(params._meta);
@@ -631,7 +723,7 @@ index 75b4bd7..a5acf8a 100644
      const scope: ListScope = { cwd, archived, includeWorktrees };
      const after =
        params.cursor === null || params.cursor === undefined
-@@ -525,9 +527,12 @@ export class SessionIndexService {
+@@ -517,9 +519,12 @@ export class SessionIndexService {
      });
      const live = await livePromise;
      const now = this.now();
@@ -645,12 +737,12 @@ index 75b4bd7..a5acf8a 100644
      const last = rows[rows.length - 1];
      return hasMore && last ? { sessions, nextCursor: encodeListCursor(last, scope) } : { sessions };
 diff --git a/src/session-mode.ts b/src/session-mode.ts
-index 477b9ed..a44b46f 100644
+index 2004e97..7a42254 100644
 --- a/src/session-mode.ts
 +++ b/src/session-mode.ts
-@@ -90,7 +90,8 @@ export function resolveInitialPermissionMode(
-   if (sources.explicit !== undefined) {
-     return resolvePermissionMode(sources.explicit, logger, allowBypass);
+@@ -111,7 +111,8 @@ export function resolveInitialPermissionMode(
+       builtInDefault: false,
+     };
    }
 -  if (sources.resumed !== undefined) {
 +  // 하네스 패치: 설정이 bypass 면 이어 가는 대화의 옛 모드보다 설정을 따른다.
@@ -658,6 +750,34 @@ index 477b9ed..a44b46f 100644
      let rejected = false;
      const mode = resolvePermissionMode(
        sources.resumed,
+diff --git a/src/tests/harness-autoresume.test.ts b/src/tests/harness-autoresume.test.ts
+new file mode 100644
+index 0000000..2c9b406
+--- /dev/null
++++ b/src/tests/harness-autoresume.test.ts
+@@ -0,0 +1,22 @@
++import { describe, expect, it } from "vitest";
++import { parseResetTime, resumeDelayMs } from "../harness-autoresume.js";
++
++describe("harness auto resume", () => {
++  const now = new Date(2026, 10, 1, 14, 20, 0);
++
++  it("reads the reset clock from the usage-limit text", () => {
++    const at = parseResetTime("You've hit your 5-hour limit · resets 3:40pm (Asia/Seoul)", now)!;
++    expect([at.getDate(), at.getHours(), at.getMinutes()]).toEqual([1, 15, 40]);
++  });
++
++  it("rolls past times to the next day and reads bare hours", () => {
++    const at = parseResetTime("resets 9am", now)!;
++    expect([at.getDate(), at.getHours()]).toEqual([2, 9]);
++  });
++
++  it("waits until reset plus a grace period, and gives up when unreadable or too far", () => {
++    expect(resumeDelayMs("resets 3:40pm", now)).toBe((80 * 60 + 90) * 1000);
++    expect(resumeDelayMs("limit reached", now)).toBeNull();
++    expect(resumeDelayMs("resets 1pm", now)).toBeNull();
++  });
++});
 diff --git a/src/tests/harness-usage.test.ts b/src/tests/harness-usage.test.ts
 new file mode 100644
 index 0000000..4b680e6
